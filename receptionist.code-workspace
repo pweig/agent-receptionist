@@ -1,0 +1,63 @@
+{
+  "folders": [
+    {
+      "name": "🗂 Root",
+      "path": ".",
+    },
+  ],
+  "settings": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "files.exclude": {
+      "**/node_modules": true,
+      "**/__pycache__": true,
+      "**/.venv": true,
+    },
+    "editor.rulers": [100],
+    "docker.showStartPage": false,
+    "sqltools.connections": [
+      {
+        "ssh": "Disabled",
+        "previewLimit": 50,
+        "server": "localhost",
+        "port": 5432,
+        "driver": "PostgreSQL",
+        "name": "postgres",
+        "group": "postgres",
+        "database": "marketplace",
+        "username": "marketplace",
+      },
+    ],
+    "claudeCode.useTerminal": true,
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-azuretools.vscode-docker",
+      "esbenp.prettier-vscode",
+      "dbaeumer.vscode-eslint",
+      "ms-python.python",
+      "ms-python.pylance",
+      "42crunch.vscode-openapi",
+      "humao.rest-client",
+      "mtxr.sqltools",
+      "mtxr.sqltools-driver-pg",
+      "rangav.vscode-thunder-client",
+      "jebbs.plantuml",
+    ],
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Core API (local)",
+        "type": "node",
+        "request": "launch",
+        "runtimeExecutable": "npx",
+        "runtimeArgs": ["ts-node", "src/index.ts"],
+        "cwd": "${workspaceFolder}/services/core-api",
+        "envFile": "${workspaceFolder}/.env",
+        "skipFiles": ["<node_internals>/**"],
+      },
+    ],
+  },
+}

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.pipecat.ai)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:deepwiki.com)"
+    ]
+  }
+}

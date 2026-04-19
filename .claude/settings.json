@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(grep -v \"^#\\\\|^$\" /Users/D026233/dev/agent-receptionist/.env)",
+      "Bash(curl -s -X POST https://api.daily.co/v1/rooms -H 'Authorization: Bearer 1edb951362f85f2b5f1a9ab028583c9696b37821c4696c75430bbc857b837726' -H 'Content-Type: application/json' -d '{\"properties\": {\"exp\": 3600}}')",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -c \"from services.receptionist.main import app; print\\('OK'\\)\")"
+    ]
+  }
+}

@@ -1,11 +1,20 @@
 llm:
-  model: claude-sonnet-4-6
-  max_tokens: 1024
+  # --- Groq (cloud, free tier 100k TPD) ---
+  # model: llama-3.3-70b-versatile
+  # base_url: https://api.groq.com/openai/v1
+
+  # --- Ollama (local, no limits, M3 Mac recommended) ---
+  # brew install ollama && ollama pull qwen2.5:14b
+  model: qwen2.5:14b
+  base_url: http://localhost:11434/v1
+
+  max_tokens: 512
   temperature: 0.3
-  enable_prompt_caching: true
 
 stt:
-  model: large-v3-turbo
+  # Use "small" for fast POC testing (~460MB, good EN+DE quality).
+  # Switch to "large-v3-turbo" for production-quality transcription.
+  model: small
   compute_type: int8
   device: auto
   no_speech_prob: 0.5

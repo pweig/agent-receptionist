@@ -1,16 +1,17 @@
 # Dental Office Voice Receptionist — Phase 0 POC
 
-Voice-based dental appointment booking agent. Handles greeting → language detection (EN/DE) → info collection → slot proposal → booking confirmation, end-to-end via browser audio.
+Voice-based dental appointment booking agent. Handles greeting → language selection (EN/DE) → office hours check → info collection → slot proposal → booking confirmation, end-to-end via browser audio.
 
-**Stack:** Pipecat · Daily.co WebRTC · Whisper STT · Claude claude-sonnet-4-6 · Piper TTS · Silero VAD
+**Stack:** Pipecat · SmallWebRTC (browser, no account needed) · Whisper STT · Groq `llama-3.3-70b-versatile` or Ollama `qwen2.5:14b` · Piper TTS · Silero VAD
 
 ---
 
 ## Prerequisites
 
 - Python 3.10+
-- Anthropic API key ([console.anthropic.com](https://console.anthropic.com))
-- Daily.co account — free tier ([daily.co](https://www.daily.co)) — for the browser test client
+- LLM backend (choose one):
+  - **Groq API key** — free tier at [console.groq.com](https://console.groq.com) (100k tokens/day)
+  - **Ollama** (local, no limits) — see [Local LLM Setup](#local-llm-setup-ollama) below
 
 ---
 
@@ -18,7 +19,7 @@ Voice-based dental appointment booking agent. Handles greeting → language dete
 
 ```bash
 # 1. Clone and enter the repo
-git clone <repo-url>
+git clone git@github.com:pweig/agent-receptionist.git
 cd agent-receptionist
 
 # 2. Install dependencies + download Piper TTS models (~125 MB)
@@ -26,8 +27,38 @@ make setup
 
 # 3. Configure environment
 cp .env.example .env
-# Edit .env: fill in ANTHROPIC_API_KEY and DAILY_API_KEY
+# Edit .env: fill in GROQ_API_KEY (skip if using Ollama)
 ```
+
+### Local LLM Setup (Ollama)
+
+If you prefer to run without a Groq API key:
+
+```bash
+# Install Ollama
+brew install ollama
+
+# Pull the recommended model for M-series Mac (14.8B, ~9 GB)
+ollama pull qwen2.5:14b
+
+# Start the Ollama server (keep this terminal open)
+ollama serve
+```
+
+Then in `services/receptionist/config/settings.yaml`, comment out the Groq block and uncomment the Ollama block (or vice versa):
+
+```yaml
+llm:
+  # --- Groq (cloud, free tier 100k TPD) ---
+  # model: llama-3.3-70b-versatile
+  # base_url: https://api.groq.com/openai/v1
+
+  # --- Ollama (local, no limits) ---
+  model: qwen2.5:14b
+  base_url: http://localhost:11434/v1
+```
+
+The app auto-detects which backend to use from the `base_url` field — no code changes needed.
 
 ---
 
@@ -37,11 +68,33 @@ cp .env.example .env
 make dev
 ```
 
-The agent starts and prints a Daily room URL. Open that URL in a browser — your microphone connects directly to the agent. No phone number needed.
+Opens http://localhost:7860 — click **Start Call** to connect your browser microphone directly to the agent. No phone number or external account needed.
 
-If you already have a specific Daily room URL, set it in `.env`:
-```
-DAILY_ROOM_URL=https://your-domain.daily.co/your-room
+> **Ollama users:** `ollama serve` must be running in a separate terminal before `make dev`.
+
+---
+
+## Configuration
+
+**Office hours:** `services/receptionist/config/office_hours.yaml`
+Defines weekday hours, public holidays (DE + US), date exceptions, and after-hours routing (emergency number, voicemail, callback logging).
+
+**Runtime settings:** `services/receptionist/config/settings.yaml`
+Model selection (Groq or Ollama), TTS voice names, VAD params, handoff thresholds.
+
+### Environment Variables
+
+| Variable        | Default | Description                                                                                       |
+| --------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `OFFICE_LOCALE` | `de`    | Sets greeting language and after-hours routing. `de` = German (Sie-form), anything else = English |
+| `WHISPER_MODEL` | `small` | Whisper model size. Options: `tiny`, `small`, `medium`, `large-v3-turbo`                          |
+| `PORT`          | `7860`  | Local server port                                                                                 |
+| `GROQ_API_KEY`  | —       | Required only when using Groq backend                                                             |
+
+Override Whisper model at runtime without editing yaml:
+
+```bash
+WHISPER_MODEL=tiny make dev
 ```
 
 ---
@@ -50,20 +103,25 @@ DAILY_ROOM_URL=https://your-domain.daily.co/your-room
 
 ```
 services/receptionist/
-├── main.py             — Pipecat pipeline (entry point)
+├── main.py             — Pipecat pipeline + FastAPI app (entry point)
 ├── prompt.py           — Persona + per-state system messages
 ├── state.py            — Conversation state enums and data model
 ├── handoff.py          — Handoff trigger evaluation (regex + heuristics)
+├── static/
+│   └── index.html      — Browser WebRTC client (Start Call UI)
 ├── tools/
 │   ├── pms_mock.py     — Mock PMS: search_patient, get_available_slots, book_appointment, ...
-│   └── schemas.py      — Tool definitions + LLM handler wrappers
+│   └── schemas.py      — Raw tool property dicts + TTS_VOICES constant
 ├── flows/
-│   └── nodes.py        — 9 conversation state NodeConfigs (pipecat-flows)
+│   └── nodes.py        — 9 conversation state NodeConfigs + tool handlers (pipecat-flows)
+├── models/
+│   └── piper/          — Downloaded Piper TTS .onnx voice models (created by make setup)
 └── config/
     ├── office_hours.yaml
     └── settings.yaml
 
 docs/
+├── architecture.adoc         — Full architecture reference with PlantUML diagrams
 ├── compliance_checklist.md   — HIPAA (US) + DSGVO/GDPR (DE)
 ├── evaluation_plan.md        — Metrics, test scenarios, latency benchmarks
 └── voice_config.md           — STT/TTS recommendations per phase
@@ -74,29 +132,19 @@ docs/
 ## Conversation States
 
 ```
-GREETING → LANGUAGE_DETECT → HOURS_CHECK → INTENT → INFO_COLLECTION
-→ SLOT_PROPOSAL → CONFIRMATION → CLOSING
+GREETING → HOURS_CHECK → COLLECT_INFO → SLOT_PROPOSAL → CONFIRMATION → CLOSING
 
 Any state → HANDOFF (on trigger) → CLOSING
 ```
 
-Handoff triggers (Phase 1 eager policy): caller requests human, medical question, billing dispute, rescheduling, low STT confidence (2+ turns), caller frustration.
-
----
-
-## Configuration
-
-**Office hours:** `services/receptionist/config/office_hours.yaml`
-Defines weekday hours, public holidays (DE + US), date exceptions, and after-hours routing (emergency number, voicemail, callback logging).
-
-**Runtime settings:** `services/receptionist/config/settings.yaml`
-Model selection, TTS voice names, VAD params, handoff thresholds.
+Handoff triggers (defined in `handoff.py`, wired in Phase 1): caller requests human, medical question, billing dispute, rescheduling, low STT confidence (2+ turns), caller frustration (repeated utterances).
 
 ---
 
 ## Mock PMS Data
 
 Eight fictional patient records are pre-loaded, including:
+
 - An intentional ambiguous pair (Thomas Müller / Tobias Müller) to test the ambiguous-patient handoff path
 - DE and US patients with GKV, PKV, Selbstzahler, and US insurance types
 - A pediatric patient to test the "booking on behalf of child" scenario
@@ -110,14 +158,55 @@ Target: P95 turn latency < 1000ms, > 80% booking completion, 100% handoff trigge
 
 ---
 
+## Architecture
+
+Full architecture documentation — including pipeline frame flow, state machine, tool inventory, and deployment diagrams — is in [`docs/architecture.adoc`](docs/architecture.adoc).
+
+---
+
 ## Phasing
 
-| Phase | Stack | Status |
-|---|---|---|
-| 0 — POC | Pipecat + Daily + Whisper + Piper | **This repo** |
-| 1 US | Add Twilio/Retell SIP; Deepgram STT; Cartesia TTS | Planned |
-| 1 DE | Add EU SIP; Azure STT/TTS; DSGVO compliance | Planned |
-| 2 | Rescheduling flow; sentiment-based handoff; waitlist | Future |
+| Phase   | Stack                                                                  | Status        |
+| ------- | ---------------------------------------------------------------------- | ------------- |
+| 0 — POC | SmallWebRTC (aiortc) + Whisper + Piper + Groq or Ollama                | **This repo** |
+| 1 US    | Add Twilio/Retell SIP; Deepgram STT; Cartesia TTS; Dentrix PMS         | Planned       |
+| 1 DE    | Add EU SIP; Azure STT/TTS; DSGVO compliance; Dampsoft PMS              | Planned       |
+| 2       | Rescheduling flow; sentiment-based handoff; waitlist; context trimming | Future        |
 
 See `docs/voice_config.md` for Phase 1 provider recommendations.
 See `docs/compliance_checklist.md` before any production deployment.
+
+---
+
+## Troubleshooting
+
+**Rate limit (429 from Groq)**
+You've hit the free-tier daily limit (100k tokens/day). Options: switch to Ollama (see [Local LLM Setup](#local-llm-setup-ollama)) or wait for the daily limit to reset at midnight UTC.
+
+**No audio in browser**
+Check that you granted microphone permission when prompted. Use Chrome or Firefox — Safari has known WebRTC compatibility issues and is not recommended.
+
+**Ctrl+C not stopping the server**
+The FastAPI lifespan handler cancels all active bot tasks on shutdown. If it hangs, force-kill the port:
+
+```bash
+kill $(lsof -ti:7860)
+```
+
+**Piper model missing / TTS silent**
+The `.onnx` model files were not downloaded. Re-run setup:
+
+```bash
+make setup
+```
+
+Models are saved to `services/receptionist/models/piper/`.
+
+**"Connection refused" or LLM errors with Ollama**
+`ollama serve` must be running before `make dev`. Start it in a separate terminal:
+
+```bash
+ollama serve
+```
+
+Then verify the model is pulled: `ollama list` should show `qwen2.5:14b`.

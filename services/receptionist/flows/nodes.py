@@ -1,51 +1,221 @@
 """
-NodeConfig factories for each of the 9 conversation states.
+NodeConfig factories and FlowsFunctionSchema handlers for the conversation flow.
 
-pipecat-flows drives the conversation by injecting per-state system messages
-and restricting which tools are available in each state. State transitions happen
-by returning the next NodeConfig from a tool handler (see tools/schemas.py).
+Every state transition in pipecat_flows must be triggered by a function call return.
+Nodes without functions cannot advance the flow. To handle this, nodes that would
+naturally have no tools use lightweight "transition" functions that the LLM calls
+to signal intent (e.g., set_language, set_intent, select_slot, complete_handoff).
 
-Tool availability per state:
-  greeting          — none
-  language_detect   — set_language (internal)
-  hours_check       — get_office_hours
-  intent            — none
-  info_collection   — search_patient
-  slot_proposal     — get_available_slots
-  confirmation      — book_appointment, send_confirmation
-  handoff           — none
-  closing           — none
+Flow:
+  greeting ──set_language──► hours_check ──get_office_hours──► collect_info / closing
+  collect_info ──search_patient / request_slots──► slot_proposal / handoff
+  slot_proposal ──confirm_slot / get_more_slots──► confirmation / slot_proposal / handoff
+  confirmation ──book_appointment / send_confirmation──► closing
+  handoff ──────────────────────────────────────────────────► closing
+  closing ─── end_conversation (post_action)
 """
 
-from pipecat_flows import FlowConfig, FlowsFunctionSchema
+from __future__ import annotations
+
+from pipecat.frames.frames import TTSUpdateSettingsFrame
+from pipecat_flows import FlowManager, FlowsFunctionSchema, NodeConfig
 
 from ..prompt import PERSONA_SYSTEM_PROMPT, STATE_TASK_MESSAGES
+from ..tools.pms_mock import (
+    book_appointment,
+    get_available_slots,
+    get_office_hours,
+    search_patient,
+    send_confirmation,
+)
 from ..tools.schemas import (
-    BOOK_APPOINTMENT_SCHEMA,
-    GET_AVAILABLE_SLOTS_SCHEMA,
-    GET_OFFICE_HOURS_SCHEMA,
-    SEARCH_PATIENT_SCHEMA,
-    SEND_CONFIRMATION_SCHEMA,
-    SET_LANGUAGE_SCHEMA,
+    BOOK_APPOINTMENT_PROPS,
+    GET_AVAILABLE_SLOTS_PROPS,
+    GET_OFFICE_HOURS_PROPS,
+    SEARCH_PATIENT_PROPS,
+    SEND_CONFIRMATION_PROPS,
+    TTS_VOICES,
 )
 
 
-def _role(extra: str = "") -> list[dict]:
-    content = PERSONA_SYSTEM_PROMPT + ("\n\n" + extra if extra else "")
-    return [{"role": "system", "content": content}]
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _role() -> list[dict]:
+    return [{"role": "system", "content": PERSONA_SYSTEM_PROMPT}]
 
 
-def _task(state_key: str) -> list[dict]:
-    return [{"role": "system", "content": STATE_TASK_MESSAGES[state_key]}]
+def _task(key: str) -> list[dict]:
+    return [{"role": "system", "content": STATE_TASK_MESSAGES[key]}]
 
 
-def _schema(raw: dict) -> FlowsFunctionSchema:
+_GREETINGS = {
+    "en": 'Say: "Muster Dental Practice, this is Lena speaking, how can I help you?"',
+    "de": 'Say: "Zahnarztpraxis Muster, hier ist Lena, was kann ich für Sie tun?"',
+}
+
+
+def _greeting_task(lang: str) -> str:
+    greeting = _GREETINGS.get(lang, _GREETINGS["en"])
+    return (
+        f"{greeting}\n"
+        f"After the caller responds, call set_language(\"{lang}\") to continue.\n"
+        "Do not ask for their name yet."
+    )
+
+
+def _fn(name: str, description: str, properties: dict, required: list, handler) -> FlowsFunctionSchema:
     return FlowsFunctionSchema(
-        name=raw["name"],
-        description=raw["description"],
-        properties=raw["input_schema"].get("properties", {}),
-        required=raw["input_schema"].get("required", []),
-        handler=raw["handler"],
+        name=name,
+        description=description,
+        properties=properties,
+        required=required,
+        handler=handler,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers — PMS tools
+# ---------------------------------------------------------------------------
+
+async def _handle_get_office_hours(args: dict, flow_manager: FlowManager):
+    result = await get_office_hours((args or {}).get("date"))
+    flow_manager.state["office_hours"] = result
+    # Only transition from the hours_check node; elsewhere return info without changing state.
+    if flow_manager.current_node == "hours_check":
+        if result.get("closed"):
+            return result, create_closing_node()
+        return result, create_collect_info_node()
+    return result, None
+
+
+async def _handle_search_patient(args: dict, flow_manager: FlowManager):
+    a = args or {}
+    result = await search_patient(a.get("name", ""), a.get("dob"))
+    flow_manager.state["patient_record"] = result
+    # Stay in collect_info; LLM handles ambiguous / not_found cases via task message
+    return result, None
+
+
+async def _handle_request_slots(args: dict, flow_manager: FlowManager):
+    """LLM calls this when all info is collected; fetches slots and advances to slot_proposal."""
+    a = args or {}
+    result = await get_available_slots(
+        visit_type=a.get("visit_type", "checkup"),
+        urgency=a.get("urgency", "routine"),
+        date_range=a.get("date_range"),
+    )
+    flow_manager.state["proposed_slots"] = result.get("slots", [])
+    return result, create_slot_proposal_node()
+
+
+async def _handle_get_more_slots(args: dict, flow_manager: FlowManager):
+    """Fetch additional slots when the caller wants alternatives."""
+    a = args or {}
+    result = await get_available_slots(
+        visit_type=a.get("visit_type", "checkup"),
+        urgency=a.get("urgency", "routine"),
+        date_range=a.get("date_range"),
+    )
+    flow_manager.state["proposed_slots"] = result.get("slots", [])
+    # Stay in slot_proposal
+    return result, None
+
+
+async def _handle_book_appointment(args: dict, flow_manager: FlowManager):
+    a = args or {}
+    result = await book_appointment(
+        patient_id=a.get("patient_id", ""),
+        slot_id=a.get("slot_id", ""),
+        visit_type=a.get("visit_type", "checkup"),
+        notes=a.get("notes", ""),
+    )
+    if result.get("status") == "confirmed":
+        flow_manager.state["confirmation_id"] = result.get("confirmation_id")
+        flow_manager.state["booked_appointment"] = result.get("appointment")
+    # Stay in confirmation; LLM calls send_confirmation next
+    return result, None
+
+
+async def _handle_send_confirmation(args: dict, flow_manager: FlowManager):
+    a = args or {}
+    result = await send_confirmation(
+        patient_id=a.get("patient_id", ""),
+        appointment=flow_manager.state.get("booked_appointment", {}),
+        channel=a.get("channel", "sms"),
+    )
+    return result, create_closing_node()
+
+
+# ---------------------------------------------------------------------------
+# Handlers — transition functions (no PMS call; just signal intent to flow)
+# ---------------------------------------------------------------------------
+
+async def _handle_set_language(args: dict, flow_manager: FlowManager):
+    lang = (args or {}).get("language", "en")
+    if lang not in TTS_VOICES:
+        lang = "en"
+    flow_manager.state["language"] = lang
+    await flow_manager.task.queue_frame(
+        TTSUpdateSettingsFrame(settings={"voice": TTS_VOICES[lang]})
+    )
+    # Only advance to hours_check from the greeting node; elsewhere just update the voice.
+    if flow_manager.current_node == "greeting":
+        return {"language_set": lang}, create_hours_check_node()
+    return {"language_set": lang}, None
+
+
+async def _handle_set_intent(args: dict, flow_manager: FlowManager):
+    """LLM calls this after determining caller intent. Booking → collect_info; else → handoff."""
+    intent = (args or {}).get("intent", "booking")
+    flow_manager.state["intent"] = intent
+    if intent == "booking":
+        return {"intent": intent}, create_collect_info_node()
+    return {"intent": intent}, create_handoff_node()
+
+
+async def _handle_confirm_slot(args: dict, flow_manager: FlowManager):
+    """LLM calls this when the caller accepts a slot."""
+    a = args or {}
+    flow_manager.state["chosen_slot"] = a.get("slot_id")
+    return {"slot_confirmed": a.get("slot_id")}, create_confirmation_node()
+
+
+async def _handle_transfer_to_human(args: dict, flow_manager: FlowManager):
+    """Any node can call this to immediately route to handoff."""
+    flow_manager.state["handoff_reason"] = (args or {}).get("reason", "caller_requested")
+    return {"handoff": True}, create_handoff_node()
+
+
+async def _handle_complete_handoff(args: dict, flow_manager: FlowManager):
+    return {"done": True}, create_closing_node()
+
+
+# ---------------------------------------------------------------------------
+# Shared transfer-to-human schema (available in every node that needs it)
+# ---------------------------------------------------------------------------
+
+def _transfer_fn() -> FlowsFunctionSchema:
+    return _fn(
+        name="transfer_to_human",
+        description=(
+            "Transfer the caller to a human receptionist. Call this when: "
+            "the caller requests a human, asks to reschedule/cancel, asks a medical question, "
+            "has a billing dispute, or the conversation cannot proceed."
+        ),
+        properties={
+            "reason": {
+                "type": "string",
+                "enum": [
+                    "caller_requested", "medical_question", "billing_dispute",
+                    "reschedule", "outside_scope", "frustration",
+                ],
+                "description": "Reason for the transfer.",
+            }
+        },
+        required=["reason"],
+        handler=_handle_transfer_to_human,
     )
 
 
@@ -53,104 +223,192 @@ def _schema(raw: dict) -> FlowsFunctionSchema:
 # Node factories
 # ---------------------------------------------------------------------------
 
-def create_greeting_node() -> dict:
+def create_set_language_schema() -> FlowsFunctionSchema:
+    """Global function — available in every node so the LLM can switch language at any time."""
+    return _fn(
+        name="set_language",
+        description=(
+            "Signal the detected caller language. Call this when the caller's language is "
+            "identified or changes. From the greeting node this also advances the conversation; "
+            "from any other node it only updates the TTS voice."
+        ),
+        properties={
+            "language": {
+                "type": "string",
+                "enum": ["en", "de"],
+                "description": "ISO 639-1 code: 'en' for English, 'de' for German.",
+            }
+        },
+        required=["language"],
+        handler=_handle_set_language,
+    )
+
+
+def create_get_office_hours_schema() -> FlowsFunctionSchema:
+    """Global function — only transitions the flow when called from the hours_check node."""
+    return _fn(
+        name=GET_OFFICE_HOURS_PROPS["name"],
+        description=GET_OFFICE_HOURS_PROPS["description"],
+        properties=GET_OFFICE_HOURS_PROPS["properties"],
+        required=GET_OFFICE_HOURS_PROPS["required"],
+        handler=_handle_get_office_hours,
+    )
+
+
+def create_greeting_node(lang: str = "en") -> NodeConfig:
+    lang_desc = "German (always use formal 'Sie' address)" if lang == "de" else "English"
+    lang_msg = {
+        "role": "system",
+        "content": (
+            f"LANGUAGE LOCK: This call is in {lang_desc}. "
+            f"Every single response you produce MUST be in {lang_desc}. "
+            "Do not switch languages under any circumstances."
+        ),
+    }
     return {
-        "role_messages": _role(),
-        "task_messages": _task("greeting"),
+        "name": "greeting",
+        "role_messages": _role() + [lang_msg],
+        "task_messages": [{"role": "system", "content": _greeting_task(lang)}],
         "functions": [],
     }
 
 
-def create_language_detection_node() -> dict:
+def create_hours_check_node() -> NodeConfig:
     return {
-        "role_messages": _role(),
-        "task_messages": _task("language_detection"),
-        "functions": [_schema(SET_LANGUAGE_SCHEMA)],
-    }
-
-
-def create_hours_check_node() -> dict:
-    return {
+        "name": "hours_check",
         "role_messages": _role(),
         "task_messages": _task("hours_check"),
-        "functions": [_schema(GET_OFFICE_HOURS_SCHEMA)],
+        "functions": [],
     }
 
 
-def create_intent_node() -> dict:
+def create_intent_node() -> NodeConfig:
     return {
         "role_messages": _role(),
         "task_messages": _task("intent"),
-        "functions": [],
-        # Transitions to info_collection or handoff are driven by LLM response
-        # and the handoff.evaluate_handoff() call in the event handler.
-    }
-
-
-def create_info_collection_node() -> dict:
-    return {
-        "role_messages": _role(),
-        "task_messages": _task("info_collection"),
-        "functions": [_schema(SEARCH_PATIENT_SCHEMA)],
-    }
-
-
-def create_slot_proposal_node() -> dict:
-    return {
-        "role_messages": _role(),
-        "task_messages": _task("slot_proposal"),
-        "functions": [_schema(GET_AVAILABLE_SLOTS_SCHEMA)],
-    }
-
-
-def create_confirmation_node() -> dict:
-    return {
-        "role_messages": _role(),
-        "task_messages": _task("confirmation"),
         "functions": [
-            _schema(BOOK_APPOINTMENT_SCHEMA),
-            _schema(SEND_CONFIRMATION_SCHEMA),
+            _fn(
+                name="set_intent",
+                description=(
+                    "Signal the caller's intent after asking how you can help. "
+                    "Use 'booking' for new appointments; 'other' for everything else."
+                ),
+                properties={
+                    "intent": {
+                        "type": "string",
+                        "enum": ["booking", "other"],
+                        "description": "'booking' to proceed with new appointment, 'other' to transfer.",
+                    }
+                },
+                required=["intent"],
+                handler=_handle_set_intent,
+            ),
+            _transfer_fn(),
         ],
     }
 
 
-def create_handoff_node() -> dict:
+def create_collect_info_node() -> NodeConfig:
     return {
         "role_messages": _role(),
-        "task_messages": _task("handoff"),
-        "functions": [],
+        "task_messages": _task("collect_info"),
+        "functions": [
+            _fn(
+                name=SEARCH_PATIENT_PROPS["name"],
+                description=SEARCH_PATIENT_PROPS["description"],
+                properties=SEARCH_PATIENT_PROPS["properties"],
+                required=SEARCH_PATIENT_PROPS["required"],
+                handler=_handle_search_patient,
+            ),
+            _fn(
+                name="request_slots",
+                description=(
+                    "Call this when all required information has been collected "
+                    "(name, DOB, phone, visit reason, insurance). "
+                    "Fetches available slots and advances to slot proposal."
+                ),
+                properties=GET_AVAILABLE_SLOTS_PROPS["properties"],
+                required=GET_AVAILABLE_SLOTS_PROPS["required"],
+                handler=_handle_request_slots,
+            ),
+            _transfer_fn(),
+        ],
     }
 
 
-def create_closing_node() -> dict:
+def create_slot_proposal_node() -> NodeConfig:
+    return {
+        "role_messages": _role(),
+        "task_messages": _task("slot_proposal"),
+        "functions": [
+            _fn(
+                name="confirm_slot",
+                description="Confirm the slot the caller has chosen.",
+                properties={
+                    "slot_id": {
+                        "type": "string",
+                        "description": "The slot ID from the proposed slots list.",
+                    }
+                },
+                required=["slot_id"],
+                handler=_handle_confirm_slot,
+            ),
+            _fn(
+                name="get_more_slots",
+                description="Fetch additional slots when the caller wants different options.",
+                properties=GET_AVAILABLE_SLOTS_PROPS["properties"],
+                required=GET_AVAILABLE_SLOTS_PROPS["required"],
+                handler=_handle_get_more_slots,
+            ),
+            _transfer_fn(),
+        ],
+    }
+
+
+def create_confirmation_node() -> NodeConfig:
+    return {
+        "role_messages": _role(),
+        "task_messages": _task("confirmation"),
+        "functions": [
+            _fn(
+                name=BOOK_APPOINTMENT_PROPS["name"],
+                description=BOOK_APPOINTMENT_PROPS["description"],
+                properties=BOOK_APPOINTMENT_PROPS["properties"],
+                required=BOOK_APPOINTMENT_PROPS["required"],
+                handler=_handle_book_appointment,
+            ),
+            _fn(
+                name=SEND_CONFIRMATION_PROPS["name"],
+                description=SEND_CONFIRMATION_PROPS["description"],
+                properties=SEND_CONFIRMATION_PROPS["properties"],
+                required=SEND_CONFIRMATION_PROPS["required"],
+                handler=_handle_send_confirmation,
+            ),
+            _transfer_fn(),
+        ],
+    }
+
+
+def create_handoff_node() -> NodeConfig:
+    return {
+        "role_messages": _role(),
+        "task_messages": _task("handoff"),
+        "functions": [
+            _fn(
+                name="complete_handoff",
+                description="Call this after informing the caller of the transfer or after-hours message.",
+                properties={},
+                required=[],
+                handler=_handle_complete_handoff,
+            ),
+        ],
+    }
+
+
+def create_closing_node() -> NodeConfig:
     return {
         "role_messages": _role(),
         "task_messages": _task("closing"),
         "functions": [],
         "post_actions": [{"type": "end_conversation"}],
     }
-
-
-# ---------------------------------------------------------------------------
-# Full flow config (all nodes wired together for FlowManager initialization)
-# ---------------------------------------------------------------------------
-
-def build_flow_config() -> FlowConfig:
-    """
-    Returns the complete FlowConfig used to initialize the FlowManager.
-    The initial node is 'greeting'; transitions are driven by tool call handlers.
-    """
-    return FlowConfig(
-        initial_node="greeting",
-        nodes={
-            "greeting": create_greeting_node(),
-            "language_detection": create_language_detection_node(),
-            "hours_check": create_hours_check_node(),
-            "intent": create_intent_node(),
-            "info_collection": create_info_collection_node(),
-            "slot_proposal": create_slot_proposal_node(),
-            "confirmation": create_confirmation_node(),
-            "handoff": create_handoff_node(),
-            "closing": create_closing_node(),
-        },
-    )

@@ -1,12 +1,12 @@
 """
 Phase 0 POC — Dental Office Voice Receptionist
-Pipecat pipeline: Daily WebRTC → Silero VAD → Whisper STT → Claude LLM → Piper TTS → Daily
+Pipecat pipeline: SmallWebRTC (browser) → VAD → Whisper STT → Groq LLM → Piper TTS → SmallWebRTC
+
+No external accounts needed — runs entirely on localhost.
 
 Usage:
-    python -m services.receptionist.main
-
-Or via the Makefile:
-    make dev
+    make dev        # starts on http://localhost:7860
+    Open http://localhost:7860 in a browser, click "Start Call"
 """
 
 import asyncio
@@ -16,26 +16,157 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.frames.frames import (
+    Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
+    TranscriptionFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.piper.tts import PiperTTSService
-from pipecat.services.whisper import WhisperSTTService, Model
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.services.whisper.stt import WhisperSTTService, Model
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import (
+    SmallWebRTCPatchRequest,
+    SmallWebRTCRequest,
+    SmallWebRTCRequestHandler,
+)
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_flows import FlowManager
 
-from .flows.nodes import build_flow_config
+from .flows.nodes import create_get_office_hours_schema, create_greeting_node, create_set_language_schema
 from .state import initial_state
-from .tools.schemas import TTS_VOICES
+
+# ---------------------------------------------------------------------------
+# Debug frame logger — prints key pipeline events to stdout
+# ---------------------------------------------------------------------------
+
+_C = {          # ANSI colour codes
+    "cyan":    "\033[36m",
+    "green":   "\033[32m",
+    "yellow":  "\033[33m",
+    "magenta": "\033[35m",
+    "blue":    "\033[34m",
+    "reset":   "\033[0m",
+}
+
+
+class DebugFrameLogger(FrameProcessor):
+    """Lightweight pipeline observer that prints key events.
+
+    Inserted after TTS so it sees every frame flowing toward transport.output():
+    VAD events, transcriptions, LLM text chunks, tool calls, TTS boundaries.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._llm_buf = ""
+
+    def _check_started(self, frame: Frame) -> bool:
+        # Metrics and urgent frames can arrive before StartFrame propagates
+        # through the full pipeline. As a passthrough observer we allow all.
+        return True
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # super() handles StartFrame bookkeeping (sets internal __started flag).
+        await super().process_frame(frame, direction)
+
+        c = _C
+
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            print(f"{c['cyan']}[VAD ] user started speaking{c['reset']}", flush=True)
+
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            print(f"{c['cyan']}[VAD ] user stopped speaking{c['reset']}", flush=True)
+
+        elif isinstance(frame, TranscriptionFrame):
+            lang = frame.language or "?"
+            print(f"{c['green']}[STT ] \"{frame.text}\"  lang={lang}{c['reset']}", flush=True)
+
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            self._llm_buf = ""
+            print(f"{c['yellow']}[LLM ] ", end="", flush=True)
+
+        elif isinstance(frame, LLMTextFrame):
+            self._llm_buf += frame.text
+            print(frame.text, end="", flush=True)
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            print(f"{c['reset']}", flush=True)
+
+        elif isinstance(frame, FunctionCallInProgressFrame):
+            print(
+                f"{c['magenta']}[TOOL] → {frame.function_name}  args={frame.arguments}{c['reset']}",
+                flush=True,
+            )
+
+        elif isinstance(frame, FunctionCallResultFrame):
+            snippet = str(frame.result)[:120]
+            print(
+                f"{c['magenta']}[TOOL] ← {frame.function_name}  result={snippet}{c['reset']}",
+                flush=True,
+            )
+
+        elif isinstance(frame, TTSStartedFrame):
+            print(f"{c['blue']}[TTS ] speaking...{c['reset']}", flush=True)
+
+        elif isinstance(frame, TTSStoppedFrame):
+            print(f"{c['blue']}[TTS ] done{c['reset']}", flush=True)
+
+        await self.push_frame(frame, direction)
 
 load_dotenv()
 
 _CONFIG_DIR = Path(__file__).parent / "config"
+_STATIC_DIR = Path(__file__).parent / "static"
+
+_bot_tasks: set[asyncio.Task] = set()
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    # Cancel all active bot tasks on shutdown so Ctrl+C exits cleanly
+    for t in list(_bot_tasks):
+        t.cancel()
+    if _bot_tasks:
+        await asyncio.gather(*_bot_tasks, return_exceptions=True)
+
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_webrtc_handler = SmallWebRTCRequestHandler()
 
 
 def _load_settings() -> dict:
@@ -43,63 +174,80 @@ def _load_settings() -> dict:
         return yaml.safe_load(f)
 
 
-async def run_bot(room_url: str, token: str) -> None:
+async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     settings = _load_settings()
     session_id = str(uuid.uuid4())
 
-    # --- Transport (Daily WebRTC) ---
-    transport = DailyTransport(
-        room_url,
-        token,
-        "Lena (Receptionist)",
-        params=DailyParams(
+    # Language is determined by OFFICE_LOCALE at startup ("de" or anything else → "en").
+    # The TTS voice, initial state, and greeting are all set from this value.
+    _locale = os.environ.get("OFFICE_LOCALE", "de").lower()
+    lang = "de" if _locale == "de" else "en"
+
+    # --- Transport (SmallWebRTC — no external account needed) ---
+    transport = SmallWebRTCTransport(
+        webrtc_connection,
+        params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            audio_in_user_tracks=True,
-            # Do NOT set transcription_enabled=True — we use WhisperSTTService instead.
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(
-                params=VADParams(stop_secs=settings["vad"]["stop_secs"])
-            ),
         ),
+    )
+
+    # --- VAD (pipeline processor; not built into SmallWebRTC like it was in Daily) ---
+    vad = VADProcessor(
+        vad_analyzer=SileroVADAnalyzer(
+            params=VADParams(stop_secs=settings["vad"]["stop_secs"])
+        )
     )
 
     # --- STT: faster-whisper, multilingual (language=None → auto-detect) ---
+    _model_raw = os.environ.get("WHISPER_MODEL", settings["stt"]["model"])
+    _model_key = _model_raw.upper().replace("-", "_")
+    _whisper_model_str = Model[_model_key].value
     stt = WhisperSTTService(
-        model=Model.LARGE_V3_TURBO,
+        settings=WhisperSTTService.Settings(
+            model=_whisper_model_str,
+            no_speech_prob=settings["stt"]["no_speech_prob"],
+        ),
         device=settings["stt"]["device"],
         compute_type=settings["stt"]["compute_type"],
-        no_speech_prob=settings["stt"]["no_speech_prob"],
     )
 
-    # --- LLM: Claude with prompt caching ---
-    llm = AnthropicLLMService(
-        api_key=os.environ["ANTHROPIC_API_KEY"],
-        model=settings["llm"]["model"],
-        max_tokens=settings["llm"]["max_tokens"],
-        enable_prompt_caching=settings["llm"]["enable_prompt_caching"],
-        params=AnthropicLLMService.InputParams(
+    # --- LLM: OpenAI-compatible endpoint (Groq or local Ollama) ---
+    # Ollama doesn't need a real key; fall back to "ollama" so the env var stays optional.
+    llm = OpenAILLMService(
+        api_key=os.environ.get("GROQ_API_KEY", "ollama"),
+        base_url=settings["llm"]["base_url"],
+        settings=OpenAILLMService.Settings(
+            model=settings["llm"]["model"],
             temperature=settings["llm"]["temperature"],
+            max_tokens=settings["llm"]["max_tokens"],
         ),
     )
 
-    # --- TTS: Piper, starts with English; switches to DE via TTSUpdateSettingsFrame ---
+    # --- TTS: Piper — voice chosen from OFFICE_LOCALE at startup ---
     tts = PiperTTSService(
-        voice=settings["tts"]["en"]["voice"],
-        download_dir=str(Path(__file__).parent / "models" / "piper"),
+        settings=PiperTTSService.Settings(voice=settings["tts"][lang]["voice"]),
+        download_dir=Path(__file__).parent / "models" / "piper",
     )
 
     # --- LLM context ---
-    context = OpenAILLMContext()
-    context_aggregator = llm.create_context_aggregator(context)
+    context = LLMContext()
+    context_aggregator = LLMContextAggregatorPair(context)
+
+    # --- Debug observer (always on for POC; remove in production) ---
+    debug = DebugFrameLogger()
 
     # --- Pipeline ---
+    # debug sits after TTS so it sees every downstream frame:
+    # VAD events, STT transcriptions, LLM text/tool calls, TTS boundaries.
     pipeline = Pipeline([
         transport.input(),
+        vad,
         stt,
         context_aggregator.user(),
         llm,
         tts,
+        debug,
         transport.output(),
         context_aggregator.assistant(),
     ])
@@ -110,80 +258,70 @@ async def run_bot(room_url: str, token: str) -> None:
             allow_interruptions=True,
             enable_metrics=True,
         ),
-        idle_timeout_secs=300,  # end call after 5 min of silence
+        idle_timeout_secs=300,
     )
 
     # --- FlowManager ---
-    flow_config = build_flow_config()
     flow_manager = FlowManager(
         task=task,
         llm=llm,
         context_aggregator=context_aggregator,
-        flow_config=flow_config,
+        global_functions=[create_set_language_schema(), create_get_office_hours_schema()],
     )
-
-    # Store session state on the flow_manager for handler access
-    flow_manager.state = initial_state(session_id)
+    state = initial_state(session_id)
+    state["language"] = lang
+    flow_manager.state.update(state)
 
     # --- Event handlers ---
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await flow_manager.initialize(create_greeting_node(lang))
 
-    @transport.event_handler("on_first_participant_joined")
-    async def on_first_participant_joined(transport, participant):
-        await transport.capture_participant_transcription(participant["id"])
-        await flow_manager.initialize()
-
-    @transport.event_handler("on_participant_left")
-    async def on_participant_left(transport, participant, reason):
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
         await task.cancel()
 
-    @transport.event_handler("on_call_state_updated")
-    async def on_call_state_updated(transport, state):
-        if state == "left":
-            await task.cancel()
-
     # --- Run ---
-    runner = PipelineRunner()
+    # handle_sigint=False: let uvicorn own SIGINT. Multiple runners each
+    # installing their own handler fight with uvicorn and block Ctrl+C.
+    runner = PipelineRunner(handle_sigint=False)
     await runner.run(task)
 
 
+# ---------------------------------------------------------------------------
+# FastAPI routes — WebRTC signaling
+# ---------------------------------------------------------------------------
+
+@app.post("/api/offer")
+async def offer(request: SmallWebRTCRequest):
+    async def _start_bot(connection: SmallWebRTCConnection):
+        task = asyncio.create_task(run_bot(connection))
+        _bot_tasks.add(task)
+        task.add_done_callback(_bot_tasks.discard)
+
+    return await _webrtc_handler.handle_web_request(
+        request=request,
+        webrtc_connection_callback=_start_bot,
+    )
+
+
+@app.patch("/api/offer")
+async def ice_candidate(request: SmallWebRTCPatchRequest):
+    await _webrtc_handler.handle_patch_request(request)
+    return {"status": "success"}
+
+
+@app.get("/")
+async def index():
+    return HTMLResponse((_STATIC_DIR / "index.html").read_text())
+
+
 def main():
-    """Entry point: reads DAILY_ROOM_URL and DAILY_TOKEN from environment."""
-    room_url = os.environ.get("DAILY_ROOM_URL", "")
-    token = os.environ.get("DAILY_TOKEN", "")
+    import uvicorn
 
-    if not room_url:
-        _create_daily_room_and_run()
-        return
-
-    asyncio.run(run_bot(room_url, token))
-
-
-def _create_daily_room_and_run():
-    """Create a temporary Daily room via the REST API and print the URL."""
-    import aiohttp
-
-    async def _create_and_run():
-        api_key = os.environ.get("DAILY_API_KEY", "")
-        if not api_key:
-            raise SystemExit(
-                "Set DAILY_ROOM_URL or DAILY_API_KEY in .env\n"
-                "  cp .env.example .env && fill in your keys"
-            )
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.daily.co/v1/rooms",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"properties": {"exp": 3600}},
-            ) as resp:
-                data = await resp.json()
-
-        room_url = data["url"]
-        print(f"\n  Room URL: {room_url}")
-        print("  Open the URL in a browser to test the agent.\n")
-        await run_bot(room_url, "")
-
-    asyncio.run(_create_and_run())
+    port = int(os.environ.get("PORT", 7860))
+    print(f"\n  Open http://localhost:{port} in a browser to test the agent.\n")
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":

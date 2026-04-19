@@ -1,0 +1,723 @@
+= Dental Office Voice Receptionist — Architecture Reference
+:toc: left
+:toclevels: 3
+:icons: font
+:source-highlighter: highlightjs
+:plantuml-server-url: http://www.plantuml.com/plantuml
+
+== 1. Overview
+
+The Dental Office Voice Receptionist is a voice-first appointment booking agent for a dental practice. Callers interact with the agent through spoken natural language — the system handles greeting, language selection, patient lookup, slot proposal, booking confirmation, and graceful escalation to a human receptionist.
+
+*Phase 0 (this repo)* is a proof-of-concept that runs entirely on localhost. A browser-based WebRTC client (`static/index.html`) replaces a real telephone connection. No external telephony account or cloud subscription is required — the only optional external dependency is the Groq API for LLM inference; the system also runs fully offline with Ollama.
+
+*Supported locales:* The agent speaks German (formal _Sie_-form) or English. The active locale is set once at startup via the `OFFICE_LOCALE` environment variable (`de` or anything else → `en`). Language is locked for the entire call — there is no mid-call detection. The initial greeting, TTS voice, and after-hours routing message are all derived from this value.
+
+The pipeline is built on *Pipecat 1.0.0* with the `pipecat-flows` library managing the conversation state machine. The LLM backend is configurable: either *Groq* (`llama-3.3-70b-versatile`, cloud) or *Ollama* (`qwen2.5:14b`, local). Both are exposed through the OpenAI-compatible `OpenAILLMService`. Speech recognition uses *faster-whisper* (multilingual EN/DE). Text-to-speech uses *Piper* with locally cached `.onnx` model files.
+
+== 2. System Context
+
+[plantuml,system-context,svg]
+....
+@startuml
+skinparam componentStyle rectangle
+skinparam backgroundColor #FEFEFE
+skinparam ArrowColor #444444
+
+actor "Caller\n(browser mic)" as Caller
+
+package "localhost" {
+
+  package "FastAPI app  (main.py)" as FastAPI {
+    [POST /api/offer\n(WebRTC signaling)] as Offer
+    [PATCH /api/offer\n(ICE candidates)] as ICE
+    [GET /\n(index.html)] as Index
+  }
+
+  package "Pipecat Pipeline" as Pipeline {
+    [SmallWebRTCTransport.input()\n(aiortc)] as RTCIn
+    [VADProcessor\n(SileroVADAnalyzer)] as VAD
+    [WhisperSTTService\n(faster-whisper, EN/DE)] as STT
+    [LLMContextAggregator\n(user side)] as AggUser
+    [OpenAILLMService\n(Groq OR Ollama)] as LLM
+    [PiperTTSService\n(.onnx local models)] as TTS
+    [DebugFrameLogger\n(passthrough, stdout)] as Debug
+    [SmallWebRTCTransport.output()\n(aiortc)] as RTCOut
+    [LLMContextAggregator\n(assistant side)] as AggAsst
+  }
+
+  [FlowManager\n(pipecat-flows)] as FM
+  [Tool Handlers\n(flows/nodes.py)] as Handlers
+  [Mock PMS\n(tools/pms_mock.py)] as PMS
+  database "Piper TTS Models\n(.onnx files)" as PiperModels
+  [Config\nsettings.yaml\noffice_hours.yaml] as Config
+
+  RTCIn --> VAD
+  VAD --> STT
+  STT --> AggUser
+  AggUser --> LLM
+  LLM --> TTS
+  TTS --> Debug
+  Debug --> RTCOut
+  RTCOut --> AggAsst
+  LLM <--> FM : frames
+  FM --> Handlers : tool dispatch
+  Handlers --> PMS : async calls
+  TTS --> PiperModels : load voice
+  FastAPI --> Config : read at startup
+}
+
+package "External (one active)" {
+  cloud "Groq API\nhttps://api.groq.com/openai/v1" as Groq
+  [Ollama\nlocalhost:11434/v1] as Ollama
+}
+
+Caller <--> FastAPI : WebRTC (audio+signaling)
+LLM --> Groq : OpenAI-compat API (optional)
+LLM --> Ollama : OpenAI-compat API (optional)
+
+@enduml
+....
+
+== 3. Pipeline Frame Flow
+
+The following sequence diagram shows a single happy-path voice turn: the caller speaks, the pipeline transcribes, the LLM decides to call a tool, the tool result comes back, the LLM generates a spoken reply, and the caller hears it.
+
+[plantuml,frame-flow,svg]
+....
+@startuml
+skinparam sequenceArrowThickness 1.5
+skinparam backgroundColor #FEFEFE
+
+participant "Caller" as C
+participant "Browser" as B
+participant "SmallWebRTC\nTransport" as T
+participant "VADProcessor" as VAD
+participant "WhisperSTT\nService" as STT
+participant "LLMContext\nAggregator" as Agg
+participant "OpenAILLM\nService" as LLM
+participant "FlowManager\n+ ToolHandler" as FM
+participant "PiperTTS\nService" as TTS
+
+C -> B : speaks
+B -> T : AudioRawFrame (PCM)
+T -> VAD : AudioRawFrame
+VAD -> VAD : Silero VAD analyzes
+VAD -> STT : VADUserStartedSpeakingFrame
+note right of VAD: buffering audio
+VAD -> STT : AudioRawFrame (buffered)
+VAD -> STT : VADUserStoppedSpeakingFrame
+STT -> STT : faster-whisper transcribes
+STT -> Agg : TranscriptionFrame\n(text, language, confidence)
+Agg -> LLM : LLMMessagesFrame\n(updated context)
+LLM -> LLM : llama/qwen generates
+LLM -> FM : FunctionCallInProgressFrame\n(e.g. request_slots)
+FM -> FM : handler executes\n(calls pms_mock async fn)
+FM -> LLM : FunctionCallResultFrame\n(slots dict)
+LLM -> LLM : generates spoken reply
+LLM -> TTS : LLMTextFrame (streamed tokens)
+TTS -> TTS : Piper synthesizes\n(.onnx model)
+TTS -> T : AudioRawFrame (TTS PCM)
+T -> B : WebRTC audio
+B -> C : caller hears response
+
+@enduml
+....
+
+== 4. Conversation State Machine
+
+The flow is managed by *pipecat-flows* `FlowManager`. Each state is a `NodeConfig` with a set of callable functions; state transitions happen exclusively via tool call return values from the handlers in `flows/nodes.py`.
+
+[plantuml,state-machine,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam StateBackgroundColor #EEF4FF
+skinparam StateBorderColor #4466AA
+
+[*] --> greeting : on_client_connected\n(transport event)
+
+greeting --> hours_check : set_language("en"|"de")\n[global fn — updates TTS voice]
+
+hours_check --> collect_info : get_office_hours()\nreturns open\n[global fn]
+hours_check --> closing : get_office_hours()\nreturns closed
+
+collect_info --> slot_proposal : request_slots()\n[all 6 fields collected]
+collect_info --> handoff : transfer_to_human()\nor ambiguous patient
+
+slot_proposal --> slot_proposal : get_more_slots()\n[caller wants alternatives]
+slot_proposal --> confirmation : confirm_slot()
+slot_proposal --> handoff : transfer_to_human()
+
+confirmation --> closing : send_confirmation()\n[after book_appointment]
+confirmation --> slot_proposal : [caller changes mind —\nLLM returns to slot_proposal]
+confirmation --> handoff : transfer_to_human()
+
+handoff --> closing : complete_handoff()
+
+closing --> [*] : end_conversation\n(post_action)
+
+state "intent\n(defined but not\nwired in current flow)" as intent #EEEEEE
+
+note bottom of intent
+  create_intent_node() exists in nodes.py
+  but is never called by the running pipeline.
+  The current flow goes directly from
+  hours_check to collect_info.
+end note
+
+@enduml
+....
+
+NOTE: `set_language` and `get_office_hours` are registered as *global functions* on the `FlowManager` and are therefore available in every node. `transfer_to_human` is included explicitly in `collect_info`, `slot_proposal`, and `confirmation` nodes only.
+
+== 5. Booking Flow
+
+[plantuml,booking-activity,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #EEF4FF
+skinparam activityBorderColor #4466AA
+
+|Caller|
+|Lena (Agent)|
+|System|
+
+|Caller|
+start
+:Dials in (opens browser,\nclicks Start Call);
+
+|Lena (Agent)|
+:Greets caller\n("Muster Dental Practice,\nthis is Lena…");
+
+|System|
+:set_language() called\n→ transition to hours_check;
+:get_office_hours() called\nautomatically;
+
+|Lena (Agent)|
+if (Office open?) then (yes)
+  :Acknowledges, asks how to help;
+else (no)
+  :Reads after-hours message\n+ emergency number;
+  |Caller|
+  stop
+endif
+
+|Caller|
+:States reason for calling\n(new appointment);
+
+|Lena (Agent)|
+:Collects info one question at a time:\n1. New/existing patient?\n2. Full name\n3. Date of birth\n4. Phone number\n5. Reason for visit\n6. Insurance;
+
+|System|
+:search_patient(name, dob)\ncalled when name+DOB known;
+note right: status: found / multiple / not_found
+
+|Lena (Agent)|
+if (Patient found?) then (found)
+  :Confirms patient record;
+elseif (multiple matches?) then (multiple)
+  :Asks for DOB to disambiguate;
+  if (Still ambiguous?) then (yes)
+    :Calls transfer_to_human;
+    |System|
+    :→ handoff node;
+    |Caller|
+    stop
+  else (resolved)
+    :Confirms disambiguated record;
+  endif
+else (not found)
+  :Treats as new patient;
+endif
+
+|System|
+:request_slots(visit_type, urgency)\n→ transition to slot_proposal;
+
+|Lena (Agent)|
+:Proposes 2–3 available slots\n(day, time, provider);
+
+|Caller|
+:Chooses a slot;
+
+|System|
+:confirm_slot(slot_id)\n→ transition to confirmation;
+
+|Lena (Agent)|
+:Reads back appointment details\n(name, date, time, visit type, phone);
+
+|Caller|
+:Confirms;
+
+|System|
+:book_appointment(patient_id,\nslot_id, visit_type);
+:send_confirmation(patient_id, channel)\n→ transition to closing;
+
+|Lena (Agent)|
+:Thanks caller, mentions\ndate/time one more time\n("Have a great day!");
+
+|Caller|
+stop
+
+@enduml
+....
+
+== 6. Use Case Diagram
+
+[plantuml,use-cases,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam usecaseBackgroundColor #EEF4FF
+skinparam usecaseBorderColor #4466AA
+
+left to right direction
+
+actor "Caller" as C
+actor "Human Receptionist" as HR
+
+rectangle "Muster Dental — Voice Receptionist" {
+  usecase "Book new appointment" as UC1
+  usecase "Get after-hours\nemergency info" as UC2
+  usecase "Switch language\n(EN / DE)" as UC3
+  usecase "Request human transfer" as UC4
+
+  usecase "Verify existing patient" as UC1a
+  usecase "Propose available slots" as UC1b
+  usecase "Send booking confirmation" as UC1c
+
+  usecase "Receive patient transfer" as UC5
+}
+
+C --> UC1
+C --> UC2
+C --> UC3
+C --> UC4
+
+UC1 .> UC1a : <<include>>
+UC1 .> UC1b : <<include>>
+UC1 .> UC1c : <<include>>
+
+HR --> UC5
+UC4 ..> UC5 : triggers
+
+@enduml
+....
+
+== 7. Module Structure
+
+[plantuml,module-structure,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam componentStyle rectangle
+skinparam packageBackgroundColor #F5F5FF
+skinparam packageBorderColor #7777AA
+
+package "services/receptionist/" {
+
+  [main.py] as Main
+  [prompt.py] as Prompt
+  [state.py] as State
+  [handoff.py] as Handoff
+
+  package "flows/" {
+    [nodes.py] as Nodes
+  }
+
+  package "tools/" {
+    [pms_mock.py] as PMS
+    [schemas.py] as Schemas
+  }
+
+  package "config/" {
+    [settings.yaml] as Settings
+    [office_hours.yaml] as OfficeHours
+  }
+}
+
+Main --> Nodes : create_greeting_node,\ncreate_set_language_schema,\ncreate_get_office_hours_schema
+Main --> State : initial_state()
+Main --> Settings : loaded via yaml at run_bot()
+
+Nodes --> PMS : book_appointment,\nget_available_slots,\nget_office_hours,\nsearch_patient,\nsend_confirmation
+Nodes --> Schemas : *_PROPS dicts,\nTTS_VOICES
+Nodes --> Prompt : PERSONA_SYSTEM_PROMPT,\nSTATE_TASK_MESSAGES
+Nodes --> State : ConversationState (informational)
+
+Handoff --> State : HandoffReason enum
+
+PMS --> OfficeHours : loaded via yaml\nin get_office_hours()
+
+note bottom of Handoff
+  evaluate_handoff() is defined here but
+  NOT wired into the pipeline. The LLM
+  routes to handoff via transfer_to_human
+  tool call instead.
+end note
+
+@enduml
+....
+
+== 8. LLM Tool Calling
+
+The table below lists every tool registered with the `FlowManager`. Global functions are available in all nodes; node-specific functions are injected only when that node is active.
+
+[cols="2,2,3,2,3", options="header"]
+|===
+|Tool name
+|Available in
+|Parameters
+|Returns
+|Side effects on `flow_manager.state`
+
+|`set_language`
+|GLOBAL (all nodes)
+|`language: "en"\|"de"` (required)
+|`{language_set: str}`
+|Sets `state["language"]`; queues `TTSUpdateSettingsFrame` to switch Piper voice; transitions `greeting → hours_check`
+
+|`get_office_hours`
+|GLOBAL (all nodes)
+|`date: str` (ISO, optional)
+|`{open, close}` or `{closed, emergency_number, message}`
+|Sets `state["office_hours"]`; transitions `hours_check → collect_info` (open) or `hours_check → closing` (closed)
+
+|`search_patient`
+|`collect_info` only
+|`name: str` (required), `dob: str` (optional)
+|`{status: "found"\|"multiple"\|"not_found", patient?\|candidates?}`
+|Sets `state["patient_record"]`; no node transition (LLM handles result inline)
+
+|`request_slots`
+|`collect_info` only
+|`visit_type: enum` (required), `urgency: enum` (required), `date_range: obj` (optional)
+|`{slots: [...]}`
+|Sets `state["proposed_slots"]`; transitions `collect_info → slot_proposal`
+
+|`confirm_slot`
+|`slot_proposal` only
+|`slot_id: str` (required)
+|`{slot_confirmed: str}`
+|Sets `state["chosen_slot"]`; transitions `slot_proposal → confirmation`
+
+|`get_more_slots`
+|`slot_proposal` only
+|`visit_type: enum` (required), `urgency: enum` (required), `date_range: obj` (optional)
+|`{slots: [...]}`
+|Updates `state["proposed_slots"]`; stays in `slot_proposal` (loop)
+
+|`book_appointment`
+|`confirmation` only
+|`patient_id: str`, `slot_id: str`, `visit_type: enum` (all required), `notes: str` (optional)
+|`{status: "confirmed"\|"slot_taken"\|"patient_not_found", confirmation_id?, appointment?}`
+|On success: sets `state["confirmation_id"]` and `state["booked_appointment"]`; stays in `confirmation`
+
+|`send_confirmation`
+|`confirmation` only
+|`patient_id: str` (required), `channel: "sms"\|"email"` (optional, default `sms`)
+|`{status: "sent", channel, recipient, confirmation_id, timestamp}`
+|Transitions `confirmation → closing`
+
+|`transfer_to_human`
+|`collect_info`, `slot_proposal`, `confirmation`
+|`reason: enum` (required): `caller_requested\|medical_question\|billing_dispute\|reschedule\|outside_scope\|frustration`
+|`{handoff: true}`
+|Sets `state["handoff_reason"]`; transitions current node → `handoff`
+
+|`complete_handoff`
+|`handoff` only
+|_(none)_
+|`{done: true}`
+|Transitions `handoff → closing`
+|===
+
+== 9. Handoff Triggers
+
+`evaluate_handoff()` in `handoff.py` implements six trigger types using regex patterns and simple heuristics. It is a pure Python function with no Pipecat dependencies.
+
+IMPORTANT: `evaluate_handoff()` is currently *not wired into the pipeline*. In Phase 0 the LLM routes to the handoff node exclusively via the `transfer_to_human` tool call. `evaluate_handoff()` is defined and tested but not called from any pipeline frame processor.
+
+[cols="2,3,3", options="header"]
+|===
+|Trigger type
+|Condition
+|Example patterns
+
+|`CALLER_REQUESTED`
+|Regex match on explicit human-request phrases (EN + DE)
+|"speak to a person", "transfer me", "Mensch sprechen", "Mitarbeiter", "verbinden"
+
+|`MEDICAL_QUESTION`
+|Regex match on symptom/treatment/medication content
+|"symptoms", "antibiotic", "Entzündung", "Antibiotika", "Behandlung empfehlen"
+
+|`BILLING_DISPUTE`
+|Regex match on invoice/insurance dispute patterns
+|"invoice", "overcharged", "Rechnung", "Kostenübernahme", "Beschwerde"
+
+|`RESCHEDULE`
+|Regex match on reschedule/cancel patterns
+|"reschedule", "cancel", "Umtermin", "Termin absagen", "kann nicht kommen"
+
+|`LOW_STT_CONFIDENCE`
+|Whisper `language_probability` < 0.45 for 2+ consecutive turns
+|(`state["stt_low_confidence_count"]` ≥ `low_confidence_consecutive_turns` in settings.yaml)
+
+|`FRUSTRATION`
+|Jaccard similarity ≥ 0.6 between consecutive utterances, count ≥ 2
+|Caller repeating nearly the same sentence twice in a row
+|===
+
+== 10. Configuration Reference
+
+=== 10.1 settings.yaml
+
+[cols="1,2,2,3", options="header"]
+|===
+|Section
+|Key
+|Default (current)
+|Description
+
+|`llm`
+|`model`
+|`qwen2.5:14b`
+|LLM model name. Use `llama-3.3-70b-versatile` for Groq.
+
+|`llm`
+|`base_url`
+|`http://localhost:11434/v1`
+|LLM API base URL. Use `https://api.groq.com/openai/v1` for Groq.
+
+|`llm`
+|`temperature`
+|`0.3`
+|LLM sampling temperature. Lower = more deterministic.
+
+|`llm`
+|`max_tokens`
+|`512`
+|Maximum tokens per LLM response.
+
+|`stt`
+|`model`
+|`small`
+|Whisper model size. Options: `tiny`, `small`, `medium`, `large-v3-turbo`. Override via `WHISPER_MODEL` env var.
+
+|`stt`
+|`compute_type`
+|`int8`
+|faster-whisper quantization. `int8` = fastest on CPU; `float16` for GPU.
+
+|`stt`
+|`device`
+|`auto`
+|Inference device: `auto`, `cpu`, `cuda`.
+
+|`stt`
+|`no_speech_prob`
+|`0.5`
+|Whisper no-speech probability threshold. Frames above this are discarded.
+
+|`tts.en`
+|`voice`
+|`en_US-ryan-high`
+|Piper voice identifier for English.
+
+|`tts.de`
+|`voice`
+|`de_DE-thorsten-high`
+|Piper voice identifier for German.
+
+|`vad`
+|`stop_secs`
+|`0.5`
+|Seconds of silence before VAD signals end of utterance.
+
+|`vad`
+|`confidence`
+|`0.65`
+|Silero VAD confidence threshold.
+
+|`handoff`
+|`frustration_repeat_threshold`
+|`2`
+|Number of near-identical utterances before triggering FRUSTRATION.
+
+|`handoff`
+|`low_confidence_stt_threshold`
+|`0.45`
+|Whisper `language_probability` below which a turn is flagged.
+
+|`handoff`
+|`low_confidence_consecutive_turns`
+|`2`
+|Consecutive low-confidence turns required before FRUSTRATION fires.
+
+|`handoff`
+|`tool_error_max`
+|`2`
+|Max tool errors before auto-handoff (not yet wired in Phase 0).
+
+|`office`
+|`timezone`
+|`Europe/Berlin`
+|Office timezone for hours/holiday calculations.
+
+|`office`
+|`locale`
+|`de`
+|Default locale. Overridden by `OFFICE_LOCALE` env var.
+|===
+
+=== 10.2 office_hours.yaml
+
+The file is loaded by `tools/pms_mock.py:get_office_hours()`. Structure:
+
+[source,yaml]
+----
+timezone: "Europe/Berlin"
+
+weekday_hours:
+  monday:    { open: "08:00", close: "18:00" }
+  # ... tuesday–friday; saturday/sunday: closed
+
+exceptions:                      # date-specific overrides
+  "2026-12-24": { open: "08:00", close: "12:00" }
+  "2026-05-01": closed
+
+holidays:                        # full closures — list of ISO date strings
+  - "2026-01-01"                 # DE: Neujahr / US: New Year's Day
+  # ... DE public holidays + US federal holidays
+
+after_hours_routing:
+  emergency_number_de: "+49-800-111-2222"
+  emergency_number_us: "+1-800-555-0123"
+  voicemail_enabled: true
+  callback_logging: true
+  message_de: "Unsere Praxis ist derzeit nicht erreichbar. ..."
+  message_en: "Our practice is currently closed. ..."
+----
+
+Priority order for `_is_office_open()`: *exceptions* > *holidays* > *weekday_hours*.
+
+== 11. Deployment Topologies
+
+=== 11.1 Phase 0 — Local POC (current)
+
+[plantuml,phase0-deploy,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam nodeBackgroundColor #EEF4FF
+skinparam nodeBorderColor #4466AA
+
+node "Developer's Machine" {
+  [Chrome / Firefox\nbrowser client\n(static/index.html)] as Browser
+  [FastAPI + Pipecat\n(uvicorn, port 7860)] as API
+  [faster-whisper\n(CPU/MPS, int8)] as Whisper
+  [Piper TTS\n(.onnx local files)] as Piper
+  [Ollama\n(qwen2.5:14b, localhost:11434)\nOR Groq API key] as LLM
+
+  Browser <--> API : WebRTC (localhost)
+  API --> Whisper : audio frames
+  API --> Piper : text → audio
+  API --> LLM : OpenAI-compat HTTP
+}
+
+@enduml
+....
+
+=== 11.2 Phase 1 — Production Target
+
+[plantuml,phase1-deploy,svg]
+....
+@startuml
+skinparam backgroundColor #FEFEFE
+skinparam nodeBackgroundColor #EEF4FF
+skinparam nodeBorderColor #4466AA
+skinparam cloudBackgroundColor #FFF8EE
+
+node "Production Server\n(cloud VM)" {
+  [FastAPI + Pipecat\n(gunicorn/uvicorn)] as API
+  [Deepgram STT\nAPI client] as STT
+  [Cartesia TTS\nAPI client] as TTS
+  [Real PMS Adapter\n(Dampsoft / Dentrix)] as PMS
+}
+
+cloud "Telephony" {
+  [Twilio\n(US, SIP)] as TwilioUS
+  [EU SIP Provider\n(DE, DSGVO-compliant)] as EuSIP
+}
+
+cloud "AI Services" {
+  [Groq / OpenAI\nProduction LLM] as LLMCloud
+  [Deepgram\nSTT API] as DeepgramCloud
+  [Cartesia\nTTS API] as CartesiaCloud
+}
+
+database "Practice DB\n(Dampsoft / Dentrix)" as DB
+
+TwilioUS --> API : SIP/RTP
+EuSIP --> API : SIP/RTP (EU)
+API --> STT
+API --> TTS
+API --> PMS
+STT --> DeepgramCloud
+TTS --> CartesiaCloud
+API --> LLMCloud
+PMS --> DB
+
+@enduml
+....
+
+== 12. Known Limitations & Roadmap
+
+=== 12.1 Current Limitations (Phase 0)
+
+[cols="1,3", options="header"]
+|===
+|Area
+|Description
+
+|Handoff routing
+|`evaluate_handoff()` in `handoff.py` is fully implemented (regex + heuristics) but *not connected* to the Pipecat pipeline. The LLM routes to handoff exclusively via the `transfer_to_human` tool. Consequence: a caller who does not explicitly ask for a transfer but triggers a FRUSTRATION or LOW_STT_CONFIDENCE pattern will not be auto-escalated in Phase 0.
+
+|Context window
+|Conversation history grows unbounded within a session. There is no context trimming or summarization. Long calls will eventually exceed the LLM's context limit.
+
+|Concurrency
+|The FastAPI app spawns one Pipecat pipeline per WebRTC connection (`asyncio.create_task`). There is no shared state, no call queue, and no concurrency cap. Capacity is limited by available CPU/RAM.
+
+|PMS data
+|`tools/pms_mock.py` uses in-memory dicts. All data (patients, bookings) resets on server restart. Not suitable for production without replacing with a real PMS adapter.
+
+|Authentication
+|No caller identity verification. Any browser can connect. No PIN, no callback verification, no fraud detection.
+
+|Debug logging
+|`DebugFrameLogger` is inserted into the pipeline unconditionally (always on). It prints every VAD, STT, LLM, and TTS event to stdout with ANSI colour codes. Remove or gate behind a flag before production.
+|===
+
+=== 12.2 Roadmap
+
+[cols="1,1,3", options="header"]
+|===
+|Phase
+|Target
+|Changes
+
+|Phase 1 US
+|Telephony + cloud STT/TTS
+|Replace SmallWebRTC with Twilio/Retell SIP; Deepgram STT; Cartesia TTS; real PMS adapter (Dentrix)
+
+|Phase 1 DE
+|EU compliance
+|EU SIP provider; Azure STT/TTS (Azure DE region); DSGVO/GDPR compliance layer; Dampsoft PMS adapter
+
+|Phase 2
+|Robustness + features
+|Wire `evaluate_handoff()` into the pipeline (pre-LLM frame processor); add rescheduling/cancellation flow; sentiment-based escalation; waitlist node; context trimming (sliding window or summarization); practice knowledge-base injection; multi-call concurrency management
+|===
