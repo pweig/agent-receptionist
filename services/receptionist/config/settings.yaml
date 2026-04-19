@@ -1,0 +1,35 @@
+llm:
+  model: claude-sonnet-4-6
+  max_tokens: 1024
+  temperature: 0.3
+  enable_prompt_caching: true
+
+stt:
+  model: large-v3-turbo
+  compute_type: int8
+  device: auto
+  no_speech_prob: 0.5
+
+tts:
+  en:
+    voice: en_US-ryan-high
+    download_dir: ./models/piper
+  de:
+    voice: de_DE-thorsten-high
+    download_dir: ./models/piper
+
+vad:
+  stop_secs: 0.5
+  confidence: 0.65
+
+handoff:
+  frustration_repeat_threshold: 2
+  low_confidence_stt_threshold: 0.45
+  low_confidence_consecutive_turns: 2
+  tool_error_max: 2
+
+office:
+  timezone: Europe/Berlin
+  config_path: ./config/office_hours.yaml
+  # locale options: "de" | "us"
+  locale: de

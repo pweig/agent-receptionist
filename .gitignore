@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+services/receptionist/models/
+*.onnx
+*.onnx.json
+.DS_Store
