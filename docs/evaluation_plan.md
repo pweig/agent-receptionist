@@ -58,27 +58,36 @@ R5. Cancel for a caller whose name is not in PMS → search_patient returns not_
 
 ## Instrumentation
 
-### Latency processor
+### Event log — `logs/events.jsonl`
 
-Implemented. `LatencyStartMark` sits after STT, `LatencyEndMark` sits after TTS
-(see [services/receptionist/processors.py](../services/receptionist/processors.py)
-and the `pipeline = Pipeline([...])` block in
-[services/receptionist/main.py](../services/receptionist/main.py)).
+All per-session telemetry is appended to a single JSONL file, one record per
+line. Each record has an `event` field identifying its type:
 
-Each caller turn appends a record to `logs/latency.jsonl`:
+| `event`            | Written by                                      | Key payload fields                                    |
+|--------------------|-------------------------------------------------|-------------------------------------------------------|
+| `turn_latency`     | `LatencyEndMark` in [processors.py](../services/receptionist/processors.py) | `turn_id`, `turn_latency_ms`, `stt_text_preview`      |
+| `auto_handoff`     | `HandoffEvaluator` (regex/confidence trigger)   | `reason`, `utterance`, `from_node`                    |
+| `llm_handoff`      | `_handle_transfer_to_human` in `flows/nodes.py` | `reason`, `from_node`                                 |
+| `booking_done`     | `_handle_send_confirmation`                     | `confirmation_id`, `patient_id`, `slot_id`            |
+| `reschedule_done`  | `_handle_confirm_reschedule_slot`               | `confirmation_id`, `from_slot`, `to_slot`             |
+| `cancel_done`      | `_handle_cancel_appointment`                    | `confirmation_id`, `patient_id`, `slot_id`            |
 
-```json
-{"session_id": "...", "turn_id": 3, "stt_text_preview": "I need an appointment",
- "turn_latency_ms": 847.2, "timestamp": "2026-04-20T17:22:31.442Z"}
-```
+Common fields on every record: `event`, `session_id`, `timestamp`.
 
-After running the evaluation scenarios, compute P50/P95:
+After running the evaluation scenarios:
 
 ```bash
-python -m scripts.summarize_latency logs/latency.jsonl
+python -m scripts.summarize_session logs/events.jsonl
 ```
 
-Paste the P50/P95 numbers into [docs/phase0_baseline.json](phase0_baseline.json).
+This prints:
+- P50 / P95 / min / max turn latency
+- Session outcomes (booking_done / reschedule_done / cancel_done / auto_handoff / llm_handoff / no-outcome)
+- Completion rate = (bookings + reschedules + cancellations) / total sessions
+- Handoff rate = (auto + LLM handoffs) / total sessions
+- Breakdown of handoff reasons
+
+Paste the P50/P95 and rate numbers into [docs/phase0_baseline.json](phase0_baseline.json).
 
 ### WER measurement
 
@@ -102,10 +111,10 @@ Target: ≥ 38/40 (95%).
 After completing all Phase 0 evaluation runs, fill in [docs/phase0_baseline.json](phase0_baseline.json)
 (a template with null placeholders is already committed):
 
-1. P50/P95 latency: `python -m scripts.summarize_latency logs/latency.jsonl`
+1. Latency + completion/handoff rates: `python -m scripts.summarize_session logs/events.jsonl`
 2. STT WER per language: run the 15 EN + 15 DE gold-standard utterances through Whisper with `jiwer`
-3. Booking completion rate: 10 happy-path scenarios, count successful bookings
-4. Handoff accuracy: 8 handoff scenarios (H1–H8), count triggers that fired as expected
+3. Booking completion rate: cross-check the summarizer output against the 10 happy-path scenarios
+4. Handoff accuracy: cross-check the `auto_handoff` / `llm_handoff` reasons against the 7 handoff scenarios (H1–H7)
 
 Commit the filled-in JSON. For any Phase 1 candidate provider: run the same test
 suite and compare against this baseline. Reject if any metric regresses by more than 20%.

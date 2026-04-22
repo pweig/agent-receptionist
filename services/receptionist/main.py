@@ -260,10 +260,11 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
 
     handoff_eval = HandoffEvaluator(on_trigger=_log_handoff)
 
-    # --- Latency instrumentation (writes logs/latency.jsonl) ---
+    # --- Event log (turn_latency + handoffs + completions — writes logs/events.jsonl) ---
+    event_log_path = Path(__file__).resolve().parents[2] / "logs" / "events.jsonl"
     latency_tracker = LatencyTracker(
         session_id=session_id,
-        log_path=Path(__file__).resolve().parents[2] / "logs" / "latency.jsonl",
+        log_path=event_log_path,
     )
     latency_start = LatencyStartMark(latency_tracker)
     latency_end = LatencyEndMark(latency_tracker)
@@ -304,6 +305,8 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     )
     state = initial_state(session_id)
     state["language"] = lang
+    # Expose telemetry hook to node handlers via flow_manager.state.
+    state["event_log_path"] = event_log_path
     flow_manager.state.update(state)
 
     # Now that flow_manager exists, wire the handoff evaluator to it.

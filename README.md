@@ -107,6 +107,7 @@ services/receptionist/
 ├── prompt.py           — Persona + per-state system messages
 ├── state.py            — Conversation state enums and data model
 ├── handoff.py          — Handoff trigger evaluation (regex + heuristics)
+├── telemetry.py        — Session event-log helper (append_event → logs/events.jsonl)
 ├── processors.py       — HandoffEvaluator + WhisperSTTWithConfidence pipeline processors
 ├── static/
 │   └── index.html      — Browser WebRTC client (Start Call UI)
@@ -129,7 +130,7 @@ docs/
 └── voice_config.md           — STT/TTS recommendations per phase
 
 scripts/
-└── summarize_latency.py      — P50/P95 summary over logs/latency.jsonl
+└── summarize_session.py      — P50/P95 + completion/handoff rates over logs/events.jsonl
 ```
 
 ---

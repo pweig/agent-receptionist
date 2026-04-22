@@ -19,7 +19,6 @@ Custom pipeline processors.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +33,7 @@ from pipecat_flows import FlowManager
 
 from .handoff import evaluate_handoff
 from .state import HandoffReason
+from .telemetry import append_event
 
 
 # Nodes where an auto-handoff trigger should force a transition. Excludes
@@ -130,6 +130,15 @@ class HandoffEvaluator(FrameProcessor):
         if self._on_trigger is not None:
             self._on_trigger(reason, frame.text)
 
+        append_event(
+            log_path=self.flow_manager.state.get("event_log_path"),
+            session_id=self.flow_manager.state.get("session_id", "unknown"),
+            event="auto_handoff",
+            reason=reason.value,
+            utterance=frame.text.strip()[:200],
+            from_node=self.flow_manager.current_node,
+        )
+
         # Late import avoids a circular dependency between processors and flows.
         from .flows.nodes import create_handoff_node
         await self.flow_manager.set_node_from_config(create_handoff_node())
@@ -157,16 +166,14 @@ class LatencyTracker:
 
 
 def _append_latency_record(tracker: LatencyTracker, delta_ms: float) -> None:
-    record = {
-        "session_id": tracker.session_id,
-        "turn_id": tracker.turn_idx,
-        "stt_text_preview": tracker._turn_text[:80],
-        "turn_latency_ms": round(delta_ms, 1),
-        "timestamp": time_now_iso8601(),
-    }
-    tracker.log_path.parent.mkdir(parents=True, exist_ok=True)
-    with tracker.log_path.open("a") as f:
-        f.write(json.dumps(record) + "\n")
+    append_event(
+        log_path=tracker.log_path,
+        session_id=tracker.session_id,
+        event="turn_latency",
+        turn_id=tracker.turn_idx,
+        stt_text_preview=tracker._turn_text[:80],
+        turn_latency_ms=round(delta_ms, 1),
+    )
 
 
 class LatencyStartMark(FrameProcessor):

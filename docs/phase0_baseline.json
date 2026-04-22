@@ -2,9 +2,9 @@
   "_schema": "Phase 0 regression baseline — fill in by running the 18 scenarios in docs/evaluation_plan.md.",
   "_instructions": [
     "1. `make dev` and run the 10 happy-path + edge-case scenarios (docs/evaluation_plan.md sections 'Happy path' and 'Edge cases').",
-    "2. `make dev` and run the 8 handoff scenarios (H1–H8).",
-    "3. Each session appends turn latencies to logs/latency.jsonl (written by LatencyStartMark/LatencyEndMark in services/receptionist/processors.py).",
-    "4. After all scenarios: run `python -m scripts.summarize_latency logs/latency.jsonl` to compute P50/P95; fill the numbers below.",
+    "2. Run the 7 handoff scenarios (H1–H7) and the 5 reschedule/cancel scenarios (R1–R5).",
+    "3. Each session appends events (turn_latency / auto_handoff / llm_handoff / booking_done / reschedule_done / cancel_done) to logs/events.jsonl.",
+    "4. After all scenarios: run `python -m scripts.summarize_session logs/events.jsonl`. It prints latency P50/P95, completion rate, and handoff-reason breakdown — paste into the fields below.",
     "5. STT WER + language-detection accuracy are offline measurements — see docs/evaluation_plan.md sections 'WER measurement' and 'Language detection accuracy'.",
     "6. Commit this file. Phase 1 provider evaluation runs must stay within 20% of these numbers on every metric."
   ],

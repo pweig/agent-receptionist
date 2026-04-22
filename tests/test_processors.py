@@ -206,7 +206,7 @@ from services.receptionist.processors import (
 
 
 async def test_latency_records_round_trip(tmp_path: Path):
-    log_path = tmp_path / "latency.jsonl"
+    log_path = tmp_path / "events.jsonl"
     tracker = LatencyTracker(session_id="sess-42", log_path=log_path)
     start = LatencyStartMark(tracker)
     end = LatencyEndMark(tracker)
@@ -224,6 +224,7 @@ async def test_latency_records_round_trip(tmp_path: Path):
 
     assert log_path.exists()
     record = json.loads(log_path.read_text().strip())
+    assert record["event"] == "turn_latency"
     assert record["session_id"] == "sess-42"
     assert record["turn_id"] == 1
     assert record["turn_latency_ms"] >= 0
@@ -231,7 +232,7 @@ async def test_latency_records_round_trip(tmp_path: Path):
 
 
 async def test_latency_tts_without_transcription_is_ignored(tmp_path: Path):
-    log_path = tmp_path / "latency.jsonl"
+    log_path = tmp_path / "events.jsonl"
     tracker = LatencyTracker(session_id="sess-1", log_path=log_path)
     end = LatencyEndMark(tracker)
     end._FrameProcessor__started = True
@@ -240,3 +241,23 @@ async def test_latency_tts_without_transcription_is_ignored(tmp_path: Path):
     await end.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
     assert not log_path.exists()
+
+
+async def test_auto_handoff_writes_event_record(tmp_path: Path):
+    log_path = tmp_path / "events.jsonl"
+    fm = _MockFlowManager(current_node="collect_info")
+    fm.state["session_id"] = "sess-7"
+    fm.state["event_log_path"] = log_path
+    proc = HandoffEvaluator()
+    proc.flow_manager = fm
+
+    await _process(proc, _make_frame("I need antibiotics for this pain"))
+
+    fm.set_node_from_config.assert_awaited_once()
+    assert log_path.exists()
+    record = json.loads(log_path.read_text().strip())
+    assert record["event"] == "auto_handoff"
+    assert record["session_id"] == "sess-7"
+    assert record["reason"] == HandoffReason.MEDICAL_QUESTION.value
+    assert record["from_node"] == "collect_info"
+    assert "antibiotics" in record["utterance"]

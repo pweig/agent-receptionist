@@ -28,6 +28,7 @@ from pipecat.frames.frames import TTSUpdateSettingsFrame
 from pipecat_flows import FlowManager, FlowsFunctionSchema, NodeConfig
 
 from ..prompt import PERSONA_SYSTEM_PROMPT, STATE_TASK_MESSAGES
+from ..telemetry import log_from_flow_manager
 from ..tools.pms_mock import (
     book_appointment,
     cancel_appointment,
@@ -164,7 +165,15 @@ async def _handle_cancel_appointment(args: dict, flow_manager: FlowManager):
     a = args or {}
     result = await cancel_appointment(confirmation_id=a.get("confirmation_id", ""))
     if result.get("status") == "cancelled":
-        flow_manager.state["cancelled_appointment"] = result.get("appointment")
+        cancelled = result.get("appointment", {})
+        flow_manager.state["cancelled_appointment"] = cancelled
+        log_from_flow_manager(
+            flow_manager,
+            "cancel_done",
+            confirmation_id=cancelled.get("confirmation_id"),
+            patient_id=cancelled.get("patient_id"),
+            slot_id=cancelled.get("slot_id"),
+        )
         return result, create_closing_node()
     # not_found — stay in manage_appointment so LLM can ask for clarification.
     return result, None
@@ -187,12 +196,27 @@ async def _handle_confirm_reschedule_slot(args: dict, flow_manager: FlowManager)
     a = args or {}
     confirmation_id = flow_manager.state.get("selected_confirmation_id", "")
     new_slot_id = a.get("slot_id", "")
+    # Capture the pre-reschedule slot so the event record shows what moved.
+    old_slot_id = None
+    for appt in flow_manager.state.get("patient_appointments", []):
+        if appt.get("confirmation_id") == confirmation_id:
+            old_slot_id = appt.get("slot_id")
+            break
     result = await reschedule_appointment(
         confirmation_id=confirmation_id,
         new_slot_id=new_slot_id,
     )
     if result.get("status") == "rescheduled":
-        flow_manager.state["rescheduled_appointment"] = result.get("appointment")
+        rescheduled = result.get("appointment", {})
+        flow_manager.state["rescheduled_appointment"] = rescheduled
+        log_from_flow_manager(
+            flow_manager,
+            "reschedule_done",
+            confirmation_id=confirmation_id,
+            patient_id=rescheduled.get("patient_id"),
+            from_slot=old_slot_id,
+            to_slot=new_slot_id,
+        )
         return result, create_closing_node()
     # slot_taken or not_found — stay in reschedule_slot_proposal so LLM can offer alternatives.
     return result, None
@@ -207,11 +231,21 @@ async def _handle_select_appointment(args: dict, flow_manager: FlowManager):
 
 async def _handle_send_confirmation(args: dict, flow_manager: FlowManager):
     a = args or {}
+    booked = flow_manager.state.get("booked_appointment", {})
     result = await send_confirmation(
         patient_id=a.get("patient_id", ""),
-        appointment=flow_manager.state.get("booked_appointment", {}),
+        appointment=booked,
         channel=a.get("channel", "sms"),
     )
+    if result.get("status") == "sent":
+        log_from_flow_manager(
+            flow_manager,
+            "booking_done",
+            confirmation_id=booked.get("confirmation_id"),
+            patient_id=a.get("patient_id", ""),
+            slot_id=booked.get("slot_id"),
+            visit_type=booked.get("visit_type"),
+        )
     return result, create_closing_node()
 
 
@@ -258,7 +292,14 @@ async def _handle_confirm_slot(args: dict, flow_manager: FlowManager):
 
 async def _handle_transfer_to_human(args: dict, flow_manager: FlowManager):
     """Any node can call this to immediately route to handoff."""
-    flow_manager.state["handoff_reason"] = (args or {}).get("reason", "caller_requested")
+    reason = (args or {}).get("reason", "caller_requested")
+    flow_manager.state["handoff_reason"] = reason
+    log_from_flow_manager(
+        flow_manager,
+        "llm_handoff",
+        reason=reason,
+        from_node=flow_manager.current_node,
+    )
     return {"handoff": True}, create_handoff_node()
 
 

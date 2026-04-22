@@ -405,3 +405,83 @@ async def test_reschedule_slot_proposal_node_has_required_tools():
     node = create_reschedule_slot_proposal_node()
     tool_names = {fn.name for fn in node["functions"]}
     assert {"confirm_slot", "get_more_slots", "transfer_to_human"} <= tool_names
+
+
+# ---------------------------------------------------------------------------
+# Completion events — confirm that handlers write to the event log when wired
+# ---------------------------------------------------------------------------
+
+import json
+
+def _attach_event_log(flow_manager, tmp_path):
+    log = tmp_path / "events.jsonl"
+    flow_manager.state["session_id"] = "sess-test"
+    flow_manager.state["event_log_path"] = log
+    return log
+
+
+async def test_send_confirmation_emits_booking_done(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    flow_manager.state["booked_appointment"] = {
+        "confirmation_id": "APT-01", "slot_id": "slot-1", "visit_type": "checkup",
+    }
+    with patch("services.receptionist.flows.nodes.send_confirmation",
+               new=AsyncMock(return_value={"status": "sent", "channel": "sms"})):
+        await _handle_send_confirmation({"patient_id": "P001"}, flow_manager)
+    record = json.loads(log.read_text().strip())
+    assert record["event"] == "booking_done"
+    assert record["confirmation_id"] == "APT-01"
+    assert record["patient_id"] == "P001"
+
+
+async def test_cancel_appointment_emits_cancel_done(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    cancelled = {
+        "status": "cancelled",
+        "appointment": {"confirmation_id": "APT-9", "patient_id": "P003", "slot_id": "s-9"},
+    }
+    with patch("services.receptionist.flows.nodes.cancel_appointment",
+               new=AsyncMock(return_value=cancelled)):
+        await _handle_cancel_appointment({"confirmation_id": "APT-9"}, flow_manager)
+    record = json.loads(log.read_text().strip())
+    assert record["event"] == "cancel_done"
+    assert record["confirmation_id"] == "APT-9"
+    assert record["patient_id"] == "P003"
+
+
+async def test_confirm_reschedule_slot_emits_reschedule_done(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    flow_manager.state["selected_confirmation_id"] = "APT-5"
+    flow_manager.state["patient_appointments"] = [
+        {"confirmation_id": "APT-5", "slot_id": "old-slot"},
+    ]
+    with patch("services.receptionist.flows.nodes.reschedule_appointment",
+               new=AsyncMock(return_value={
+                   "status": "rescheduled",
+                   "appointment": {"confirmation_id": "APT-5", "patient_id": "P001",
+                                   "slot_id": "new-slot"},
+               })):
+        await _handle_confirm_reschedule_slot({"slot_id": "new-slot"}, flow_manager)
+    record = json.loads(log.read_text().strip())
+    assert record["event"] == "reschedule_done"
+    assert record["confirmation_id"] == "APT-5"
+    assert record["from_slot"] == "old-slot"
+    assert record["to_slot"] == "new-slot"
+
+
+async def test_transfer_to_human_emits_llm_handoff(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    flow_manager._node = "collect_info"
+    await _handle_transfer_to_human({"reason": "medical_question"}, flow_manager)
+    record = json.loads(log.read_text().strip())
+    assert record["event"] == "llm_handoff"
+    assert record["reason"] == "medical_question"
+    assert record["from_node"] == "collect_info"
+
+
+async def test_cancel_not_found_does_not_emit_event(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    with patch("services.receptionist.flows.nodes.cancel_appointment",
+               new=AsyncMock(return_value={"status": "not_found"})):
+        await _handle_cancel_appointment({"confirmation_id": "X"}, flow_manager)
+    assert not log.exists()
