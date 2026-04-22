@@ -25,8 +25,10 @@ _HUMAN_REQUEST = _compile([
     r"\bhuman\b", r"\bperson\b", r"\brepresentative\b", r"\boperator\b",
     r"\bsomeone else\b", r"\brecept", r"\btransfer\b",
     r"\bspeak to\b", r"\btalk to\b", r"\bconnect me\b",
-    r"\bmensch\b", r"\bmitarbeiter", r"\brezeption",
-    r"\bweiterstel", r"\bsprechen mit\b", r"\bjemanden sprechen\b",
+    r"\bmensche?n?\b",                  # Mensch / Menschen / Menscher
+    r"\bmitarbeiter", r"\brezeption",
+    r"\bweiterstel", r"\bweiterverbinden",
+    r"\bsprechen mit\b", r"\bjemande[mn] sprechen",  # jemanden / jemandem
     r"\bverbinden\b",
 ])
 
@@ -45,14 +47,6 @@ _BILLING = _compile([
     r"\bGeld zurück\b", r"\bBeschwerde\b", r"\bzu viel berechnet\b",
 ])
 
-_RESCHEDULE = _compile([
-    r"\breschedul", r"\bcancel", r"\bchange.*appointment", r"\bmove.*appointment",
-    r"\bpostpone\b", r"\bmiss.*appointment\b",
-    r"\bumtermin", r"\babbuch", r"\bTermin absag", r"\bTermin verschieb",
-    r"\bTermin änder", r"\bkann nicht kommen\b",
-])
-
-
 # ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
@@ -69,9 +63,11 @@ def evaluate_handoff(
       1. CALLER_REQUESTED  — explicit request for a human
       2. MEDICAL_QUESTION  — symptom/treatment/medication content
       3. BILLING_DISPUTE   — invoicing or insurance dispute
-      4. RESCHEDULE        — Phase 1: always hand off
-      5. LOW_STT_CONFIDENCE — Whisper language_probability below threshold for N turns
-      6. FRUSTRATION       — repeated utterances or failed turns
+      4. LOW_STT_CONFIDENCE — Whisper language_probability below threshold for N turns
+      5. FRUSTRATION       — repeated utterances or failed turns
+
+    Reschedule and cancel requests are handled autonomously by the
+    manage_appointment flow, not by this evaluator.
 
     Returns HandoffReason or None.
     """
@@ -85,9 +81,6 @@ def evaluate_handoff(
 
     if _BILLING.search(lower):
         return HandoffReason.BILLING_DISPUTE
-
-    if _RESCHEDULE.search(lower):
-        return HandoffReason.RESCHEDULE
 
     if stt_language_prob is not None and stt_language_prob < 0.45:
         state["stt_low_confidence_count"] = state.get("stt_low_confidence_count", 0) + 1
@@ -125,19 +118,19 @@ def _utterances_similar(a: str, b: str) -> bool:
 #
 # When Phase 2 is ready, make these changes:
 #
-# 1. Remove _RESCHEDULE from triggers — build a dedicated rescheduling flow
-#    and route those callers there instead of to a human.
-#
-# 2. Replace _utterances_similar + repeated_turn_count with a lightweight
+# 1. Replace _utterances_similar + repeated_turn_count with a lightweight
 #    sentiment classifier (e.g. transformers zero-shot on "frustration" label).
 #    Raise threshold to 3 repeated turns after calibration on real call logs.
 #
-# 3. Raise stt_low_confidence_count threshold to 3 after calibrating on
+# 2. Raise stt_low_confidence_count threshold to 3 after calibrating on
 #    production audio quality (phone network vs. browser mic differs).
 #
-# 4. Add AMBIGUOUS_PATIENT trigger: call evaluate_ambiguous_patient(search_result)
+# 3. Add AMBIGUOUS_PATIENT trigger: call evaluate_ambiguous_patient(search_result)
 #    from the info_collection handler when search_patient returns status="multiple"
 #    and the caller cannot disambiguate after 2 clarification turns.
 #
-# 5. Add OUTSIDE_HOURS trigger separately from AFTER_HOURS (currently handled
+# 4. Add OUTSIDE_HOURS trigger separately from AFTER_HOURS (currently handled
 #    in the hours_check node directly via get_office_hours tool call).
+#
+# Reschedule and cancel requests are already handled autonomously by the
+# manage_appointment flow (services/receptionist/flows/nodes.py).

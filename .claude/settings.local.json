@@ -4,7 +4,8 @@
       "WebFetch(domain:docs.pipecat.ai)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:deepwiki.com)"
+      "WebFetch(domain:deepwiki.com)",
+      "Bash(.venv/bin/python -c ' *)"
     ]
   }
 }

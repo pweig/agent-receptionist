@@ -74,10 +74,12 @@ If closed: read out the emergency number and message from the tool result. One s
 
     "intent": """\
 Ask the caller how you can help them today (one sentence).
-Once they answer, determine their intent:
-- New appointment booking → call set_intent("booking")
-- Rescheduling, cancellation, medical question, billing, or anything else → call transfer_to_human
-Do not attempt rescheduling, cancellations, or medical advice yourself.
+Once they answer, determine their intent and call set_intent:
+- New appointment booking → set_intent("booking")
+- Rescheduling an existing appointment → set_intent("reschedule")
+- Cancelling an existing appointment → set_intent("cancel")
+- Medical question, billing, insurance dispute, or anything else → set_intent("other")
+Do not attempt medical advice, billing, or insurance issues yourself — those go to "other".
 """,
 
     "collect_info": """\
@@ -100,6 +102,44 @@ For existing patients: call search_patient after you have name + DOB.
 For pain/emergency: set urgency="emergency" when calling request_slots.
 
 Once all 6 fields are collected, call request_slots with the correct visit_type and urgency.
+""",
+
+    "manage_appointment": """\
+You are helping the caller either RESCHEDULE or CANCEL an existing appointment.
+The active intent is stored in the conversation state — reschedule or cancel.
+
+Step 1 — verify the patient:
+Ask for full name and date of birth (one question at a time) and call search_patient.
+- status="found": confirm with the caller ("I see your record, [name].") and continue.
+- status="multiple": ask for DOB to disambiguate; if still ambiguous, call transfer_to_human.
+- status="not_found": ask the caller to spell the last name; call search_patient again. \
+If still not found, apologise and call transfer_to_human — we cannot reschedule or \
+cancel an appointment that is not on file.
+
+Step 2 — list their upcoming appointments:
+Call find_patient_appointments with the verified patient_id.
+Read back the list briefly (day, time, visit type, provider). \
+If the list is empty, tell the caller and call transfer_to_human.
+
+Step 3 — select one:
+Ask the caller which appointment they mean. Call select_appointment with the \
+chosen confirmation_id.
+
+Step 4 — act on it:
+- If intent is "cancel": read back the appointment details, confirm the cancellation \
+("Just to confirm, you'd like me to cancel your appointment on [day] at [time]?"), \
+then call cancel_appointment.
+- If intent is "reschedule": ask for a preferred day/time range and call request_slots \
+with the same visit_type as the existing appointment.
+""",
+
+    "reschedule_slot_proposal": """\
+Present 2–3 new slots for the reschedule:
+"I have [day, date] at [time] with [provider], or [day, date] at [time]. Which works better?"
+
+When the caller picks one, call confirm_slot with the matching slot_id — this will \
+move the appointment. If they want other options, call get_more_slots with a different \
+date range. Do not ask open-ended "when works for you?" — always propose concrete options.
 """,
 
     "slot_proposal": """\
@@ -133,9 +173,13 @@ One sentence only — no follow-up questions.
 """,
 
     "closing": """\
-Thank the caller warmly. If an appointment was booked, mention the date and time once more.
-Wish them a good day. Two sentences maximum.
-Example: "Your appointment is confirmed for [day] at [time]. Have a great day!"
-(DE: "Ihr Termin ist bestätigt für [Tag] um [Uhrzeit]. Auf Wiederhören!")
+Thank the caller warmly (two sentences max). Match the wording to what just happened:
+- Booking confirmed → "Your appointment is confirmed for [day] at [time]. Have a great day!"
+  (DE: "Ihr Termin ist bestätigt für [Tag] um [Uhrzeit]. Auf Wiederhören!")
+- Reschedule confirmed → "Your appointment is now on [new day] at [new time]. Have a good day!"
+  (DE: "Ihr Termin ist jetzt am [neuer Tag] um [neue Uhrzeit]. Auf Wiederhören!")
+- Cancellation confirmed → "Your appointment on [day] has been cancelled. Take care!"
+  (DE: "Ihr Termin am [Tag] wurde storniert. Alles Gute!")
+- Closed (after-hours): wish them a good day / evening.
 """,
 }

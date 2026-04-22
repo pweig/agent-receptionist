@@ -26,7 +26,7 @@ class HandoffReason(str, Enum):
     MEDICAL_QUESTION = "medical_question"
     BILLING_DISPUTE = "billing_dispute"
     AMBIGUOUS_PATIENT = "ambiguous_patient"
-    RESCHEDULE = "reschedule_or_cancel"
+    RESCHEDULE = "reschedule"
     LOW_STT_CONFIDENCE = "low_stt_confidence"
     OUTSIDE_SCOPE = "outside_scope"
     AFTER_HOURS = "after_hours"

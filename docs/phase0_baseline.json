@@ -1,0 +1,27 @@
+{
+  "_schema": "Phase 0 regression baseline — fill in by running the 18 scenarios in docs/evaluation_plan.md.",
+  "_instructions": [
+    "1. `make dev` and run the 10 happy-path + edge-case scenarios (docs/evaluation_plan.md sections 'Happy path' and 'Edge cases').",
+    "2. `make dev` and run the 8 handoff scenarios (H1–H8).",
+    "3. Each session appends turn latencies to logs/latency.jsonl (written by LatencyStartMark/LatencyEndMark in services/receptionist/processors.py).",
+    "4. After all scenarios: run `python -m scripts.summarize_latency logs/latency.jsonl` to compute P50/P95; fill the numbers below.",
+    "5. STT WER + language-detection accuracy are offline measurements — see docs/evaluation_plan.md sections 'WER measurement' and 'Language detection accuracy'.",
+    "6. Commit this file. Phase 1 provider evaluation runs must stay within 20% of these numbers on every metric."
+  ],
+  "date": null,
+  "git_commit": null,
+  "stack": {
+    "llm": null,
+    "stt_model": null,
+    "tts_voices": {"en": "en_US-ryan-high", "de": "de_DE-thorsten-high"},
+    "hardware": null
+  },
+  "latency_p50_ms": null,
+  "latency_p95_ms": null,
+  "wer_en": null,
+  "wer_de": null,
+  "language_detection_accuracy": null,
+  "booking_completion_rate": null,
+  "handoff_accuracy": null,
+  "notes": ""
+}

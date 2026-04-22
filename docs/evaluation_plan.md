@@ -41,12 +41,18 @@ by more than 20% is rejected.
 ### Handoff triggers (must all fire correctly)
 H1. Caller says "Can I speak to a human?" → CALLER_REQUESTED
 H2. Caller says "What medication should I take?" → MEDICAL_QUESTION
-H3. Caller says "I want to reschedule my appointment" → RESCHEDULE
-H4. Caller says "I have a complaint about my invoice" → BILLING_DISPUTE
-H5. Low STT confidence simulated (mock language_probability=0.3 for 2 turns) → LOW_STT_CONFIDENCE
-H6. Caller repeats same sentence 3 times → FRUSTRATION
-H7. "Ambiguous patient" (two Müllers, DOB not resolving) → AMBIGUOUS_PATIENT
-H8. "Ich möchte mit jemandem sprechen" (German human request) → CALLER_REQUESTED
+H3. Caller says "I have a complaint about my invoice" → BILLING_DISPUTE
+H4. Low STT confidence simulated (mock language_probability=0.3 for 2 turns) → LOW_STT_CONFIDENCE
+H5. Caller repeats same sentence 3 times → FRUSTRATION
+H6. "Ambiguous patient" (two Müllers, DOB not resolving) → AMBIGUOUS_PATIENT
+H7. "Ich möchte mit jemandem sprechen" (German human request) → CALLER_REQUESTED
+
+### Reschedule / cancel (self-serve — must NOT hand off)
+R1. "I want to reschedule my appointment" → set_intent("reschedule") → manage_appointment flow → patient verified → appointment chosen → new slot proposed → confirmed → closing
+R2. "Ich möchte meinen Termin absagen" → set_intent("cancel") → manage_appointment flow → patient verified → appointment chosen → cancellation confirmed → closing
+R3. Reschedule a patient with no upcoming appointments → find_patient_appointments returns empty → transfer_to_human (edge case, not a handoff regression)
+R4. Reschedule "Müller" without DOB (ambiguous) → caller asked for DOB → if DOB disambiguates, flow continues; if still ambiguous → transfer_to_human
+R5. Cancel for a caller whose name is not in PMS → search_patient returns not_found after one spelling retry → transfer_to_human ("we cannot cancel an appointment that's not on file")
 
 ---
 
@@ -54,28 +60,25 @@ H8. "Ich möchte mit jemandem sprechen" (German human request) → CALLER_REQUES
 
 ### Latency processor
 
-Insert two thin `FrameProcessor` subclasses in the pipeline to timestamp each turn:
+Implemented. `LatencyStartMark` sits after STT, `LatencyEndMark` sits after TTS
+(see [services/receptionist/processors.py](../services/receptionist/processors.py)
+and the `pipeline = Pipeline([...])` block in
+[services/receptionist/main.py](../services/receptionist/main.py)).
 
-```python
-# After WhisperSTTService — record when transcription is complete
-class STTTimestampProcessor(FrameProcessor):
-    async def process_frame(self, frame, direction):
-        if isinstance(frame, TranscriptionFrame):
-            frame.metadata = {"stt_end_ts": time.monotonic_ns()}
-        await self.push_frame(frame, direction)
+Each caller turn appends a record to `logs/latency.jsonl`:
 
-# Before transport.output() — record when first audio chunk is ready
-class TTSTimestampProcessor(FrameProcessor):
-    async def process_frame(self, frame, direction):
-        if isinstance(frame, AudioRawFrame) and not self._logged:
-            stt_ts = getattr(frame, "metadata", {}).get("stt_end_ts", 0)
-            delta_ms = (time.monotonic_ns() - stt_ts) / 1_000_000
-            _log_latency(session_id, turn_id, delta_ms)
-            self._logged = True
-        await self.push_frame(frame, direction)
+```json
+{"session_id": "...", "turn_id": 3, "stt_text_preview": "I need an appointment",
+ "turn_latency_ms": 847.2, "timestamp": "2026-04-20T17:22:31.442Z"}
 ```
 
-Logs `{session_id, turn_id, stt_end_ms, tts_first_chunk_ms, delta_ms}` to `logs/latency.jsonl`.
+After running the evaluation scenarios, compute P50/P95:
+
+```bash
+python -m scripts.summarize_latency logs/latency.jsonl
+```
+
+Paste the P50/P95 numbers into [docs/phase0_baseline.json](phase0_baseline.json).
 
 ### WER measurement
 
@@ -96,25 +99,13 @@ Target: ≥ 38/40 (95%).
 
 ## Phase 0 → Phase 1 Regression Baseline
 
-After completing all Phase 0 evaluation runs:
+After completing all Phase 0 evaluation runs, fill in [docs/phase0_baseline.json](phase0_baseline.json)
+(a template with null placeholders is already committed):
 
-1. Export P50/P95 latency from `logs/latency.jsonl`
-2. Record STT WER per language
-3. Record booking completion rate and handoff accuracy
-4. Save as `docs/phase0_baseline.json`:
+1. P50/P95 latency: `python -m scripts.summarize_latency logs/latency.jsonl`
+2. STT WER per language: run the 15 EN + 15 DE gold-standard utterances through Whisper with `jiwer`
+3. Booking completion rate: 10 happy-path scenarios, count successful bookings
+4. Handoff accuracy: 8 handoff scenarios (H1–H8), count triggers that fired as expected
 
-```json
-{
-  "date": "2026-04-19",
-  "latency_p50_ms": ...,
-  "latency_p95_ms": ...,
-  "wer_en": ...,
-  "wer_de": ...,
-  "booking_completion_rate": ...,
-  "handoff_accuracy": ...,
-  "language_detection_accuracy": ...
-}
-```
-
-For any Phase 1 candidate provider: run the same test suite and compare against this baseline.
-Reject if any metric regresses by more than 20%.
+Commit the filled-in JSON. For any Phase 1 candidate provider: run the same test
+suite and compare against this baseline. Reject if any metric regresses by more than 20%.

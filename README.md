@@ -107,6 +107,7 @@ services/receptionist/
 ├── prompt.py           — Persona + per-state system messages
 ├── state.py            — Conversation state enums and data model
 ├── handoff.py          — Handoff trigger evaluation (regex + heuristics)
+├── processors.py       — HandoffEvaluator + WhisperSTTWithConfidence pipeline processors
 ├── static/
 │   └── index.html      — Browser WebRTC client (Start Call UI)
 ├── tools/
@@ -124,7 +125,11 @@ docs/
 ├── architecture.adoc         — Full architecture reference with PlantUML diagrams
 ├── compliance_checklist.md   — HIPAA (US) + DSGVO/GDPR (DE)
 ├── evaluation_plan.md        — Metrics, test scenarios, latency benchmarks
+├── phase0_baseline.json      — Regression baseline template (fill in during evaluation)
 └── voice_config.md           — STT/TTS recommendations per phase
+
+scripts/
+└── summarize_latency.py      — P50/P95 summary over logs/latency.jsonl
 ```
 
 ---
@@ -132,12 +137,24 @@ docs/
 ## Conversation States
 
 ```
-GREETING → HOURS_CHECK → COLLECT_INFO → SLOT_PROPOSAL → CONFIRMATION → CLOSING
+                          ┌──► COLLECT_INFO ──► SLOT_PROPOSAL ──► CONFIRMATION ──► CLOSING
+GREETING → HOURS_CHECK → INTENT ──► MANAGE_APPOINTMENT ──► cancel ──────────────► CLOSING
+                          │                       └──► RESCHEDULE_SLOT_PROPOSAL ──► CLOSING
+                          └──► HANDOFF ("other") ──► CLOSING
 
-Any state → HANDOFF (on trigger) → CLOSING
+Any eligible node → HANDOFF (on trigger) → CLOSING
 ```
 
-Handoff triggers (defined in `handoff.py`, wired in Phase 1): caller requests human, medical question, billing dispute, rescheduling, low STT confidence (2+ turns), caller frustration (repeated utterances).
+Intent routing from the `INTENT` node:
+- `booking` → `COLLECT_INFO` → booking flow
+- `reschedule` / `cancel` → `MANAGE_APPOINTMENT` (self-serve — no handoff)
+- `other` → `HANDOFF` (medical, billing, insurance disputes)
+
+Handoff triggers fire two ways:
+1. **LLM-driven** — the LLM calls `transfer_to_human` when the caller's request is out of scope.
+2. **Auto-triggered** — `HandoffEvaluator` (in `processors.py`) runs `evaluate_handoff()` on every caller transcription and forces a transition to the handoff node on: caller requests human, medical question, billing dispute, low STT confidence (2+ turns), caller frustration (repeated utterances).
+
+Reschedule and cancel requests are **not** handoff triggers — the `MANAGE_APPOINTMENT` flow handles them end-to-end.
 
 ---
 
@@ -148,6 +165,8 @@ Eight fictional patient records are pre-loaded, including:
 - An intentional ambiguous pair (Thomas Müller / Tobias Müller) to test the ambiguous-patient handoff path
 - DE and US patients with GKV, PKV, Selbstzahler, and US insurance types
 - A pediatric patient to test the "booking on behalf of child" scenario
+
+Three upcoming appointments are pre-seeded for reschedule/cancel testing — Thomas Müller (P001), Anna Schmidt (P003), and Sarah Johnson (P004). Seeded in `_seed_demo_appointments()` in [services/receptionist/tools/pms_mock.py](services/receptionist/tools/pms_mock.py).
 
 ---
 

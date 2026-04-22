@@ -105,8 +105,42 @@ _PATIENTS: dict[str, dict] = {
 # Booked slot IDs (prevents double-booking within a session)
 _BOOKED_SLOTS: set[str] = set()
 
-# Confirmed appointments
+# Confirmed appointments — keyed by confirmation_id.
 _APPOINTMENTS: dict[str, dict] = {}
+
+
+def _seed_demo_appointments() -> None:
+    """Pre-populate a few upcoming appointments so the reschedule/cancel flow
+    has something to act on during manual POC testing. Reset by the
+    reset_pms_state fixture in tests/conftest.py."""
+    today = date.today()
+    demo = [
+        # Thomas Müller — checkup 3 days out at 10:00
+        ("P001", today + timedelta(days=3), "10:00", "checkup"),
+        # Anna Schmidt — cleaning 5 days out at 14:00
+        ("P003", today + timedelta(days=5), "14:00", "cleaning"),
+        # Sarah Johnson — consultation 7 days out at 09:00
+        ("P004", today + timedelta(days=7), "09:00", "consultation"),
+    ]
+    for patient_id, d, t, visit_type in demo:
+        slot_id = f"{d.isoformat()}-{t.replace(':', '')}-{visit_type}"
+        confirmation_id = f"APT-SEED{patient_id[-1]}"
+        slot_dt = datetime.fromisoformat(f"{d.isoformat()}T{t}:00")
+        _APPOINTMENTS[confirmation_id] = {
+            "confirmation_id": confirmation_id,
+            "patient_id": patient_id,
+            "patient_name": _PATIENTS[patient_id]["full_name"],
+            "slot_id": slot_id,
+            "datetime_iso": slot_dt.isoformat(),
+            "visit_type": visit_type,
+            "provider": "Dr. Fischer",
+            "notes": "",
+            "booked_at": (datetime.now() - timedelta(days=2)).isoformat(),
+        }
+        _BOOKED_SLOTS.add(slot_id)
+
+
+_seed_demo_appointments()
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +381,92 @@ async def send_confirmation(
         "confirmation_id": appointment.get("confirmation_id"),
         "timestamp": datetime.now().isoformat(),
     }
+
+
+async def find_patient_appointments(patient_id: str) -> dict:
+    """
+    List upcoming appointments for a patient (past appointments excluded).
+
+    Returns:
+        {"appointments": [{confirmation_id, datetime_iso, date_human, date_human_de,
+                           time_human, visit_type, provider}, ...]}
+    """
+    now = datetime.now()
+    matching = []
+    for appt in _APPOINTMENTS.values():
+        if appt.get("patient_id") != patient_id:
+            continue
+        iso = appt.get("datetime_iso")
+        if not iso:
+            continue
+        try:
+            dt = datetime.fromisoformat(iso)
+        except ValueError:
+            continue
+        if dt <= now:
+            continue
+        matching.append({
+            "confirmation_id": appt["confirmation_id"],
+            "slot_id": appt["slot_id"],
+            "datetime_iso": dt.isoformat(),
+            "date_human": dt.strftime("%A, %B %d"),
+            "date_human_de": _german_date(dt),
+            "time_human": dt.strftime("%I:%M %p"),
+            "visit_type": appt.get("visit_type"),
+            "provider": appt.get("provider", "Dr. Fischer"),
+        })
+    matching.sort(key=lambda a: a["datetime_iso"])
+    return {"appointments": matching}
+
+
+async def cancel_appointment(confirmation_id: str) -> dict:
+    """
+    Cancel an appointment by its confirmation_id.
+
+    Returns:
+        {"status": "cancelled", "appointment": {...}}
+        {"status": "not_found"} if unknown confirmation_id
+    """
+    appt = _APPOINTMENTS.pop(confirmation_id, None)
+    if appt is None:
+        return {"status": "not_found"}
+    slot_id = appt.get("slot_id")
+    if slot_id:
+        _BOOKED_SLOTS.discard(slot_id)
+    return {"status": "cancelled", "appointment": appt}
+
+
+async def reschedule_appointment(confirmation_id: str, new_slot_id: str) -> dict:
+    """
+    Move an existing appointment to a new slot.
+
+    Returns:
+        {"status": "rescheduled", "appointment": {...}}
+        {"status": "not_found"} if confirmation_id unknown
+        {"status": "slot_taken"} if new_slot_id is already booked by someone else
+    """
+    appt = _APPOINTMENTS.get(confirmation_id)
+    if appt is None:
+        return {"status": "not_found"}
+    if new_slot_id != appt.get("slot_id") and new_slot_id in _BOOKED_SLOTS:
+        return {"status": "slot_taken"}
+
+    old_slot = appt.get("slot_id")
+    if old_slot and old_slot != new_slot_id:
+        _BOOKED_SLOTS.discard(old_slot)
+    _BOOKED_SLOTS.add(new_slot_id)
+
+    # slot_id format: YYYY-MM-DD-HHMM-visit_type
+    parts = new_slot_id.split("-")
+    if len(parts) >= 5:
+        iso_date = "-".join(parts[:3])
+        hhmm = parts[3]
+        slot_dt = datetime.fromisoformat(f"{iso_date}T{hhmm[:2]}:{hhmm[2:]}:00")
+        appt["datetime_iso"] = slot_dt.isoformat()
+    appt["slot_id"] = new_slot_id
+    appt["rescheduled_at"] = datetime.now().isoformat()
+
+    return {"status": "rescheduled", "appointment": appt}
 
 
 async def get_office_hours(date_str: Optional[str] = None) -> dict:

@@ -112,6 +112,56 @@ SEND_CONFIRMATION_PROPS = {
     "required": ["patient_id"],
 }
 
+FIND_PATIENT_APPOINTMENTS_PROPS = {
+    "name": "find_patient_appointments",
+    "description": (
+        "List the upcoming appointments for a verified patient. "
+        "Call this once search_patient has returned a confirmed patient record."
+    ),
+    "properties": {
+        "patient_id": {
+            "type": "string",
+            "description": "Patient ID from the search_patient result.",
+        },
+    },
+    "required": ["patient_id"],
+}
+
+CANCEL_APPOINTMENT_PROPS = {
+    "name": "cancel_appointment",
+    "description": (
+        "Cancel an existing appointment by its confirmation_id. "
+        "Only call this after reading the appointment details back to the caller "
+        "and receiving explicit confirmation."
+    ),
+    "properties": {
+        "confirmation_id": {
+            "type": "string",
+            "description": "Confirmation ID from find_patient_appointments.",
+        },
+    },
+    "required": ["confirmation_id"],
+}
+
+RESCHEDULE_APPOINTMENT_PROPS = {
+    "name": "reschedule_appointment",
+    "description": (
+        "Move an existing appointment to a new slot. "
+        "Call this after the caller has chosen a new slot and confirmed it."
+    ),
+    "properties": {
+        "confirmation_id": {
+            "type": "string",
+            "description": "Existing appointment's confirmation_id.",
+        },
+        "new_slot_id": {
+            "type": "string",
+            "description": "Slot ID from get_available_slots for the new time.",
+        },
+    },
+    "required": ["confirmation_id", "new_slot_id"],
+}
+
 SET_LANGUAGE_PROPS = {
     "name": "set_language",
     "description": (

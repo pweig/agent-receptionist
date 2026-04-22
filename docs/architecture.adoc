@@ -37,7 +37,8 @@ package "localhost" {
   package "Pipecat Pipeline" as Pipeline {
     [SmallWebRTCTransport.input()\n(aiortc)] as RTCIn
     [VADProcessor\n(SileroVADAnalyzer)] as VAD
-    [WhisperSTTService\n(faster-whisper, EN/DE)] as STT
+    [WhisperSTTWithConfidence\n(faster-whisper, EN/DE)] as STT
+    [HandoffEvaluator\n(auto-triggers handoff node)] as HE
     [LLMContextAggregator\n(user side)] as AggUser
     [OpenAILLMService\n(Groq OR Ollama)] as LLM
     [PiperTTSService\n(.onnx local models)] as TTS
@@ -54,7 +55,8 @@ package "localhost" {
 
   RTCIn --> VAD
   VAD --> STT
-  STT --> AggUser
+  STT --> HE
+  HE --> AggUser
   AggUser --> LLM
   LLM --> TTS
   TTS --> Debug
@@ -139,37 +141,43 @@ skinparam StateBorderColor #4466AA
 
 greeting --> hours_check : set_language("en"|"de")\n[global fn — updates TTS voice]
 
-hours_check --> collect_info : get_office_hours()\nreturns open\n[global fn]
+hours_check --> intent : get_office_hours()\nreturns open\n[global fn]
 hours_check --> closing : get_office_hours()\nreturns closed
 
+intent --> collect_info : set_intent("booking")
+intent --> manage_appointment : set_intent("reschedule"\n | "cancel")
+intent --> handoff : set_intent("other")
+
 collect_info --> slot_proposal : request_slots()\n[all 6 fields collected]
-collect_info --> handoff : transfer_to_human()\nor ambiguous patient
+collect_info --> handoff : transfer_to_human()\nor auto-trigger\n(HandoffEvaluator)
 
 slot_proposal --> slot_proposal : get_more_slots()\n[caller wants alternatives]
 slot_proposal --> confirmation : confirm_slot()
-slot_proposal --> handoff : transfer_to_human()
+slot_proposal --> handoff : transfer_to_human()\nor auto-trigger
 
 confirmation --> closing : send_confirmation()\n[after book_appointment]
 confirmation --> slot_proposal : [caller changes mind —\nLLM returns to slot_proposal]
-confirmation --> handoff : transfer_to_human()
+confirmation --> handoff : transfer_to_human()\nor auto-trigger
+
+manage_appointment --> manage_appointment : search_patient()\n+ find_patient_appointments()\n+ select_appointment()
+manage_appointment --> closing : cancel_appointment()
+manage_appointment --> reschedule_slot_proposal : request_slots()\n[intent = reschedule]
+manage_appointment --> handoff : transfer_to_human()\n(patient not found\nor ambiguous)
+
+reschedule_slot_proposal --> reschedule_slot_proposal : get_more_slots()
+reschedule_slot_proposal --> closing : confirm_slot()\n→ reschedule_appointment()
+reschedule_slot_proposal --> handoff : transfer_to_human()
 
 handoff --> closing : complete_handoff()
 
 closing --> [*] : end_conversation\n(post_action)
 
-state "intent\n(defined but not\nwired in current flow)" as intent #EEEEEE
-
-note bottom of intent
-  create_intent_node() exists in nodes.py
-  but is never called by the running pipeline.
-  The current flow goes directly from
-  hours_check to collect_info.
-end note
-
 @enduml
 ....
 
-NOTE: `set_language` and `get_office_hours` are registered as *global functions* on the `FlowManager` and are therefore available in every node. `transfer_to_human` is included explicitly in `collect_info`, `slot_proposal`, and `confirmation` nodes only.
+NOTE: `set_language` and `get_office_hours` are registered as *global functions* on the `FlowManager` and are therefore available in every node. `transfer_to_human` is included explicitly in `intent`, `collect_info`, `slot_proposal`, `confirmation`, `manage_appointment`, and `reschedule_slot_proposal` nodes. It must NOT be called for reschedule or cancel — those are handled autonomously by `manage_appointment`.
+
+NOTE: "auto-trigger" refers to the `HandoffEvaluator` frame processor (see Section 9). It runs `evaluate_handoff()` on every caller transcription and calls `FlowManager.set_node_from_config(create_handoff_node())` when a regex/heuristic trigger matches — without waiting for the LLM to call `transfer_to_human`.
 
 == 5. Booking Flow
 
@@ -321,6 +329,7 @@ package "services/receptionist/" {
   [prompt.py] as Prompt
   [state.py] as State
   [handoff.py] as Handoff
+  [processors.py] as Processors
 
   package "flows/" {
     [nodes.py] as Nodes
@@ -341,21 +350,17 @@ Main --> Nodes : create_greeting_node,\ncreate_set_language_schema,\ncreate_get_
 Main --> State : initial_state()
 Main --> Settings : loaded via yaml at run_bot()
 
-Nodes --> PMS : book_appointment,\nget_available_slots,\nget_office_hours,\nsearch_patient,\nsend_confirmation
+Nodes --> PMS : book_appointment,\nget_available_slots,\nget_office_hours,\nsearch_patient,\nsend_confirmation,\nfind_patient_appointments,\ncancel_appointment,\nreschedule_appointment
 Nodes --> Schemas : *_PROPS dicts,\nTTS_VOICES
 Nodes --> Prompt : PERSONA_SYSTEM_PROMPT,\nSTATE_TASK_MESSAGES
 Nodes --> State : ConversationState (informational)
 
 Handoff --> State : HandoffReason enum
+Processors --> Handoff : evaluate_handoff()
+Processors --> Nodes : create_handoff_node()\n(on trigger)
+Main --> Processors : WhisperSTTWithConfidence,\nHandoffEvaluator
 
 PMS --> OfficeHours : loaded via yaml\nin get_office_hours()
-
-note bottom of Handoff
-  evaluate_handoff() is defined here but
-  NOT wired into the pipeline. The LLM
-  routes to handoff via transfer_to_human
-  tool call instead.
-end note
 
 @enduml
 ....
@@ -382,31 +387,37 @@ The table below lists every tool registered with the `FlowManager`. Global funct
 |GLOBAL (all nodes)
 |`date: str` (ISO, optional)
 |`{open, close}` or `{closed, emergency_number, message}`
-|Sets `state["office_hours"]`; transitions `hours_check → collect_info` (open) or `hours_check → closing` (closed)
+|Sets `state["office_hours"]`; transitions `hours_check → intent` (open) or `hours_check → closing` (closed)
+
+|`set_intent`
+|`intent` only
+|`intent: "booking"\|"reschedule"\|"cancel"\|"other"` (required)
+|`{intent: str}`
+|Sets `state["intent"]`; transitions `intent → collect_info` (booking), `intent → manage_appointment` (reschedule/cancel), or `intent → handoff` (other)
 
 |`search_patient`
-|`collect_info` only
+|`collect_info`, `manage_appointment`
 |`name: str` (required), `dob: str` (optional)
 |`{status: "found"\|"multiple"\|"not_found", patient?\|candidates?}`
 |Sets `state["patient_record"]`; no node transition (LLM handles result inline)
 
 |`request_slots`
-|`collect_info` only
+|`collect_info`, `manage_appointment`
 |`visit_type: enum` (required), `urgency: enum` (required), `date_range: obj` (optional)
 |`{slots: [...]}`
-|Sets `state["proposed_slots"]`; transitions `collect_info → slot_proposal`
+|Sets `state["proposed_slots"]`; transitions `collect_info → slot_proposal` or `manage_appointment → reschedule_slot_proposal`
 
 |`confirm_slot`
-|`slot_proposal` only
+|`slot_proposal`, `reschedule_slot_proposal`
 |`slot_id: str` (required)
-|`{slot_confirmed: str}`
-|Sets `state["chosen_slot"]`; transitions `slot_proposal → confirmation`
+|`{slot_confirmed: str}` (booking) or `{status: "rescheduled", appointment}` (reschedule)
+|Booking: sets `state["chosen_slot"]`, transitions `slot_proposal → confirmation`. Reschedule: calls `reschedule_appointment()`, stores result in `state["rescheduled_appointment"]`, transitions `reschedule_slot_proposal → closing`
 
 |`get_more_slots`
-|`slot_proposal` only
+|`slot_proposal`, `reschedule_slot_proposal`
 |`visit_type: enum` (required), `urgency: enum` (required), `date_range: obj` (optional)
 |`{slots: [...]}`
-|Updates `state["proposed_slots"]`; stays in `slot_proposal` (loop)
+|Updates `state["proposed_slots"]`; stays in current node
 
 |`book_appointment`
 |`confirmation` only
@@ -420,11 +431,29 @@ The table below lists every tool registered with the `FlowManager`. Global funct
 |`{status: "sent", channel, recipient, confirmation_id, timestamp}`
 |Transitions `confirmation → closing`
 
+|`find_patient_appointments`
+|`manage_appointment` only
+|`patient_id: str` (required)
+|`{appointments: [{confirmation_id, datetime_iso, time_human, visit_type, provider}, ...]}`
+|Sets `state["patient_appointments"]`; stays in `manage_appointment`
+
+|`select_appointment`
+|`manage_appointment` only
+|`confirmation_id: str` (required)
+|`{selected_confirmation_id: str}`
+|Sets `state["selected_confirmation_id"]`; stays in `manage_appointment`
+
+|`cancel_appointment`
+|`manage_appointment` only
+|`confirmation_id: str` (required)
+|`{status: "cancelled"\|"not_found", appointment?}`
+|On success: sets `state["cancelled_appointment"]`, transitions `manage_appointment → closing`; on not_found: stays
+
 |`transfer_to_human`
-|`collect_info`, `slot_proposal`, `confirmation`
-|`reason: enum` (required): `caller_requested\|medical_question\|billing_dispute\|reschedule\|outside_scope\|frustration`
+|`intent`, `collect_info`, `slot_proposal`, `confirmation`, `manage_appointment`, `reschedule_slot_proposal`
+|`reason: enum` (required): `caller_requested\|medical_question\|billing_dispute\|ambiguous_patient\|outside_scope\|frustration`
 |`{handoff: true}`
-|Sets `state["handoff_reason"]`; transitions current node → `handoff`
+|Sets `state["handoff_reason"]`; transitions current node → `handoff`. Must NOT be called for reschedule or cancel requests.
 
 |`complete_handoff`
 |`handoff` only
@@ -433,11 +462,19 @@ The table below lists every tool registered with the `FlowManager`. Global funct
 |Transitions `handoff → closing`
 |===
 
+NOTE: `reschedule_appointment` is invoked by the `confirm_slot` handler in `reschedule_slot_proposal`, not exposed to the LLM directly, so the LLM only ever picks a slot — it does not need to construct the appointment-move call.
+
 == 9. Handoff Triggers
 
-`evaluate_handoff()` in `handoff.py` implements six trigger types using regex patterns and simple heuristics. It is a pure Python function with no Pipecat dependencies.
+`evaluate_handoff()` in `handoff.py` implements five trigger types using regex patterns and simple heuristics. It is a pure Python function with no Pipecat dependencies.
 
-IMPORTANT: `evaluate_handoff()` is currently *not wired into the pipeline*. In Phase 0 the LLM routes to the handoff node exclusively via the `transfer_to_human` tool call. `evaluate_handoff()` is defined and tested but not called from any pipeline frame processor.
+It is wired into the pipeline via the `HandoffEvaluator` frame processor in `processors.py`, which sits between the STT service and the user-side context aggregator. On every caller `TranscriptionFrame` it calls `evaluate_handoff(state, text, language_probability)`; if a reason is returned it sets `flow_manager.state["handoff_reason"]` and calls `flow_manager.set_node_from_config(create_handoff_node())`, forcing a transition regardless of what the LLM would have decided.
+
+Handoff is gated to the `intent`, `collect_info`, `slot_proposal`, `confirmation`, `manage_appointment`, and `reschedule_slot_proposal` nodes — greeting, hours_check, handoff and closing are excluded.
+
+IMPORTANT: reschedule and cancel requests are NOT handoff triggers. They are handled autonomously by the `manage_appointment` flow (section 4). A previous version of the evaluator matched on "reschedule"/"absagen"/"verschieben" — that behaviour was removed when the self-serve flow was added.
+
+The `language_probability` input is sourced from `WhisperSTTWithConfidence` (subclass of `WhisperSTTService` in `processors.py`) which captures faster-whisper's `info.language_probability` and stashes it in `TranscriptionFrame.result` — the built-in service discards this value.
 
 [cols="2,3,3", options="header"]
 |===
@@ -456,10 +493,6 @@ IMPORTANT: `evaluate_handoff()` is currently *not wired into the pipeline*. In P
 |`BILLING_DISPUTE`
 |Regex match on invoice/insurance dispute patterns
 |"invoice", "overcharged", "Rechnung", "Kostenübernahme", "Beschwerde"
-
-|`RESCHEDULE`
-|Regex match on reschedule/cancel patterns
-|"reschedule", "cancel", "Umtermin", "Termin absagen", "kann nicht kommen"
 
 |`LOW_STT_CONFIDENCE`
 |Whisper `language_probability` < 0.45 for 2+ consecutive turns
@@ -683,7 +716,7 @@ PMS --> DB
 |Description
 
 |Handoff routing
-|`evaluate_handoff()` in `handoff.py` is fully implemented (regex + heuristics) but *not connected* to the Pipecat pipeline. The LLM routes to handoff exclusively via the `transfer_to_human` tool. Consequence: a caller who does not explicitly ask for a transfer but triggers a FRUSTRATION or LOW_STT_CONFIDENCE pattern will not be auto-escalated in Phase 0.
+|`evaluate_handoff()` is now wired into the pipeline via `HandoffEvaluator` (see Section 9). Both LLM-driven handoffs (`transfer_to_human` tool call) and regex/heuristic-driven auto-handoffs fire. AMBIGUOUS_PATIENT is still routed only through the LLM's `transfer_to_human` call in `collect_info` — no pure-Python evaluator for it yet.
 
 |Context window
 |Conversation history grows unbounded within a session. There is no context trimming or summarization. Long calls will eventually exceed the LLM's context limit.
@@ -719,5 +752,5 @@ PMS --> DB
 
 |Phase 2
 |Robustness + features
-|Wire `evaluate_handoff()` into the pipeline (pre-LLM frame processor); add rescheduling/cancellation flow; sentiment-based escalation; waitlist node; context trimming (sliding window or summarization); practice knowledge-base injection; multi-call concurrency management
+|Remaining Phase 2 items: sentiment-based escalation; waitlist node; context trimming (sliding window or summarization); practice knowledge-base injection; multi-call concurrency management; AMBIGUOUS_PATIENT auto-trigger. (`evaluate_handoff()` pipeline wiring + rescheduling/cancellation flow are now implemented.)
 |===

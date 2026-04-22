@@ -7,10 +7,17 @@ naturally have no tools use lightweight "transition" functions that the LLM call
 to signal intent (e.g., set_language, set_intent, select_slot, complete_handoff).
 
 Flow:
-  greeting ──set_language──► hours_check ──get_office_hours──► collect_info / closing
+  greeting ──set_language──► hours_check ──get_office_hours──► intent / closing
+  intent ──set_intent("booking")──► collect_info
+  intent ──set_intent("reschedule"|"cancel")──► manage_appointment
+  intent ──set_intent("other")──► handoff
   collect_info ──search_patient / request_slots──► slot_proposal / handoff
   slot_proposal ──confirm_slot / get_more_slots──► confirmation / slot_proposal / handoff
   confirmation ──book_appointment / send_confirmation──► closing
+  manage_appointment ──search_patient + find_patient_appointments──► self (verify + list)
+  manage_appointment ──cancel_appointment──► closing
+  manage_appointment ──request_slots──► reschedule_slot_proposal
+  reschedule_slot_proposal ──confirm_slot──► reschedule_appointment ──► closing
   handoff ──────────────────────────────────────────────────► closing
   closing ─── end_conversation (post_action)
 """
@@ -23,15 +30,21 @@ from pipecat_flows import FlowManager, FlowsFunctionSchema, NodeConfig
 from ..prompt import PERSONA_SYSTEM_PROMPT, STATE_TASK_MESSAGES
 from ..tools.pms_mock import (
     book_appointment,
+    cancel_appointment,
+    find_patient_appointments,
     get_available_slots,
     get_office_hours,
+    reschedule_appointment,
     search_patient,
     send_confirmation,
 )
 from ..tools.schemas import (
     BOOK_APPOINTMENT_PROPS,
+    CANCEL_APPOINTMENT_PROPS,
+    FIND_PATIENT_APPOINTMENTS_PROPS,
     GET_AVAILABLE_SLOTS_PROPS,
     GET_OFFICE_HOURS_PROPS,
+    RESCHEDULE_APPOINTMENT_PROPS,
     SEARCH_PATIENT_PROPS,
     SEND_CONFIRMATION_PROPS,
     TTS_VOICES,
@@ -86,7 +99,7 @@ async def _handle_get_office_hours(args: dict, flow_manager: FlowManager):
     if flow_manager.current_node == "hours_check":
         if result.get("closed"):
             return result, create_closing_node()
-        return result, create_collect_info_node()
+        return result, create_intent_node()
     return result, None
 
 
@@ -138,6 +151,60 @@ async def _handle_book_appointment(args: dict, flow_manager: FlowManager):
     return result, None
 
 
+async def _handle_find_patient_appointments(args: dict, flow_manager: FlowManager):
+    """List upcoming appointments for a verified patient. Stays in manage_appointment."""
+    a = args or {}
+    result = await find_patient_appointments(patient_id=a.get("patient_id", ""))
+    flow_manager.state["patient_appointments"] = result.get("appointments", [])
+    return result, None
+
+
+async def _handle_cancel_appointment(args: dict, flow_manager: FlowManager):
+    """Cancel after the caller has confirmed. Transition to closing on success."""
+    a = args or {}
+    result = await cancel_appointment(confirmation_id=a.get("confirmation_id", ""))
+    if result.get("status") == "cancelled":
+        flow_manager.state["cancelled_appointment"] = result.get("appointment")
+        return result, create_closing_node()
+    # not_found — stay in manage_appointment so LLM can ask for clarification.
+    return result, None
+
+
+async def _handle_request_reschedule_slots(args: dict, flow_manager: FlowManager):
+    """Fetch new slots for reschedule; advances to reschedule_slot_proposal."""
+    a = args or {}
+    result = await get_available_slots(
+        visit_type=a.get("visit_type", "checkup"),
+        urgency=a.get("urgency", "routine"),
+        date_range=a.get("date_range"),
+    )
+    flow_manager.state["proposed_slots"] = result.get("slots", [])
+    return result, create_reschedule_slot_proposal_node()
+
+
+async def _handle_confirm_reschedule_slot(args: dict, flow_manager: FlowManager):
+    """Caller picked a new slot; perform the reschedule and go to closing."""
+    a = args or {}
+    confirmation_id = flow_manager.state.get("selected_confirmation_id", "")
+    new_slot_id = a.get("slot_id", "")
+    result = await reschedule_appointment(
+        confirmation_id=confirmation_id,
+        new_slot_id=new_slot_id,
+    )
+    if result.get("status") == "rescheduled":
+        flow_manager.state["rescheduled_appointment"] = result.get("appointment")
+        return result, create_closing_node()
+    # slot_taken or not_found — stay in reschedule_slot_proposal so LLM can offer alternatives.
+    return result, None
+
+
+async def _handle_select_appointment(args: dict, flow_manager: FlowManager):
+    """Record which of the listed appointments the caller wants to act on."""
+    a = args or {}
+    flow_manager.state["selected_confirmation_id"] = a.get("confirmation_id", "")
+    return {"selected_confirmation_id": a.get("confirmation_id", "")}, None
+
+
 async def _handle_send_confirmation(args: dict, flow_manager: FlowManager):
     a = args or {}
     result = await send_confirmation(
@@ -167,11 +234,18 @@ async def _handle_set_language(args: dict, flow_manager: FlowManager):
 
 
 async def _handle_set_intent(args: dict, flow_manager: FlowManager):
-    """LLM calls this after determining caller intent. Booking → collect_info; else → handoff."""
+    """LLM calls this after determining caller intent.
+
+    booking               → collect_info (new/returning patient booking)
+    reschedule | cancel   → manage_appointment (self-serve flow)
+    other                 → handoff (medical, billing, anything else)
+    """
     intent = (args or {}).get("intent", "booking")
     flow_manager.state["intent"] = intent
     if intent == "booking":
         return {"intent": intent}, create_collect_info_node()
+    if intent in ("reschedule", "cancel"):
+        return {"intent": intent}, create_manage_appointment_node()
     return {"intent": intent}, create_handoff_node()
 
 
@@ -200,16 +274,17 @@ def _transfer_fn() -> FlowsFunctionSchema:
     return _fn(
         name="transfer_to_human",
         description=(
-            "Transfer the caller to a human receptionist. Call this when: "
-            "the caller requests a human, asks to reschedule/cancel, asks a medical question, "
-            "has a billing dispute, or the conversation cannot proceed."
+            "Transfer the caller to a human receptionist. Call this when the caller "
+            "requests a human, asks a medical question, has a billing dispute, or the "
+            "conversation cannot proceed. Do NOT call this for reschedule or cancel "
+            "requests — those are handled autonomously via the manage_appointment flow."
         ),
         properties={
             "reason": {
                 "type": "string",
                 "enum": [
                     "caller_requested", "medical_question", "billing_dispute",
-                    "reschedule", "outside_scope", "frustration",
+                    "ambiguous_patient", "outside_scope", "frustration",
                 ],
                 "description": "Reason for the transfer.",
             }
@@ -284,6 +359,7 @@ def create_hours_check_node() -> NodeConfig:
 
 def create_intent_node() -> NodeConfig:
     return {
+        "name": "intent",
         "role_messages": _role(),
         "task_messages": _task("intent"),
         "functions": [
@@ -310,6 +386,7 @@ def create_intent_node() -> NodeConfig:
 
 def create_collect_info_node() -> NodeConfig:
     return {
+        "name": "collect_info",
         "role_messages": _role(),
         "task_messages": _task("collect_info"),
         "functions": [
@@ -338,6 +415,7 @@ def create_collect_info_node() -> NodeConfig:
 
 def create_slot_proposal_node() -> NodeConfig:
     return {
+        "name": "slot_proposal",
         "role_messages": _role(),
         "task_messages": _task("slot_proposal"),
         "functions": [
@@ -367,6 +445,7 @@ def create_slot_proposal_node() -> NodeConfig:
 
 def create_confirmation_node() -> NodeConfig:
     return {
+        "name": "confirmation",
         "role_messages": _role(),
         "task_messages": _task("confirmation"),
         "functions": [
@@ -389,8 +468,101 @@ def create_confirmation_node() -> NodeConfig:
     }
 
 
+def create_manage_appointment_node() -> NodeConfig:
+    """Verify patient, list their upcoming appointments, then branch to cancel or
+    reschedule. Reused for both intents — the `intent` state field decides the
+    path inside the task message."""
+    return {
+        "name": "manage_appointment",
+        "role_messages": _role(),
+        "task_messages": _task("manage_appointment"),
+        "functions": [
+            _fn(
+                name=SEARCH_PATIENT_PROPS["name"],
+                description=SEARCH_PATIENT_PROPS["description"],
+                properties=SEARCH_PATIENT_PROPS["properties"],
+                required=SEARCH_PATIENT_PROPS["required"],
+                handler=_handle_search_patient,
+            ),
+            _fn(
+                name=FIND_PATIENT_APPOINTMENTS_PROPS["name"],
+                description=FIND_PATIENT_APPOINTMENTS_PROPS["description"],
+                properties=FIND_PATIENT_APPOINTMENTS_PROPS["properties"],
+                required=FIND_PATIENT_APPOINTMENTS_PROPS["required"],
+                handler=_handle_find_patient_appointments,
+            ),
+            _fn(
+                name="select_appointment",
+                description=(
+                    "Record which appointment the caller has chosen from the list "
+                    "returned by find_patient_appointments. Call this once the caller "
+                    "has picked one — before cancel_appointment or request_slots."
+                ),
+                properties={
+                    "confirmation_id": {
+                        "type": "string",
+                        "description": "The confirmation_id of the selected appointment.",
+                    },
+                },
+                required=["confirmation_id"],
+                handler=_handle_select_appointment,
+            ),
+            _fn(
+                name=CANCEL_APPOINTMENT_PROPS["name"],
+                description=CANCEL_APPOINTMENT_PROPS["description"],
+                properties=CANCEL_APPOINTMENT_PROPS["properties"],
+                required=CANCEL_APPOINTMENT_PROPS["required"],
+                handler=_handle_cancel_appointment,
+            ),
+            _fn(
+                name="request_slots",
+                description=(
+                    "Fetch available new slots for a reschedule. "
+                    "Call this only when the caller's intent is 'reschedule' "
+                    "and they have selected an existing appointment."
+                ),
+                properties=GET_AVAILABLE_SLOTS_PROPS["properties"],
+                required=GET_AVAILABLE_SLOTS_PROPS["required"],
+                handler=_handle_request_reschedule_slots,
+            ),
+            _transfer_fn(),
+        ],
+    }
+
+
+def create_reschedule_slot_proposal_node() -> NodeConfig:
+    return {
+        "name": "reschedule_slot_proposal",
+        "role_messages": _role(),
+        "task_messages": _task("reschedule_slot_proposal"),
+        "functions": [
+            _fn(
+                name="confirm_slot",
+                description="Confirm the new slot the caller has chosen for the reschedule.",
+                properties={
+                    "slot_id": {
+                        "type": "string",
+                        "description": "The slot ID from the proposed slots list.",
+                    }
+                },
+                required=["slot_id"],
+                handler=_handle_confirm_reschedule_slot,
+            ),
+            _fn(
+                name="get_more_slots",
+                description="Fetch additional slots when the caller wants different options.",
+                properties=GET_AVAILABLE_SLOTS_PROPS["properties"],
+                required=GET_AVAILABLE_SLOTS_PROPS["required"],
+                handler=_handle_get_more_slots,
+            ),
+            _transfer_fn(),
+        ],
+    }
+
+
 def create_handoff_node() -> NodeConfig:
     return {
+        "name": "handoff",
         "role_messages": _role(),
         "task_messages": _task("handoff"),
         "functions": [
@@ -407,6 +579,7 @@ def create_handoff_node() -> NodeConfig:
 
 def create_closing_node() -> NodeConfig:
     return {
+        "name": "closing",
         "role_messages": _role(),
         "task_messages": _task("closing"),
         "functions": [],

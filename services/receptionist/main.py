@@ -56,6 +56,13 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_flows import FlowManager
 
 from .flows.nodes import create_get_office_hours_schema, create_greeting_node, create_set_language_schema
+from .processors import (
+    HandoffEvaluator,
+    LatencyEndMark,
+    LatencyStartMark,
+    LatencyTracker,
+    WhisperSTTWithConfidence,
+)
 from .state import initial_state
 
 # ---------------------------------------------------------------------------
@@ -199,11 +206,12 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
         )
     )
 
-    # --- STT: faster-whisper, multilingual (language=None → auto-detect) ---
+    # --- STT: faster-whisper. Subclass forwards info.language_probability
+    # via TranscriptionFrame.result so HandoffEvaluator can trigger on LOW_STT_CONFIDENCE.
     _model_raw = os.environ.get("WHISPER_MODEL", settings["stt"]["model"])
     _model_key = _model_raw.upper().replace("-", "_")
     _whisper_model_str = Model[_model_key].value
-    stt = WhisperSTTService(
+    stt = WhisperSTTWithConfidence(
         settings=WhisperSTTService.Settings(
             model=_whisper_model_str,
             no_speech_prob=settings["stt"]["no_speech_prob"],
@@ -237,6 +245,29 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     # --- Debug observer (always on for POC; remove in production) ---
     debug = DebugFrameLogger()
 
+    # --- Handoff evaluator ---
+    # Runs evaluate_handoff() on every caller transcription. On a trigger match
+    # (medical question, billing dispute, low STT confidence for 2+ turns, etc.)
+    # it forces a transition to the handoff node — the "eager handoff" safety net
+    # from Phase 1 of the brief. flow_manager is attached after construction
+    # because it depends on PipelineTask.
+    def _log_handoff(reason, text: str) -> None:
+        print(
+            f"{_C['magenta']}[AUTO-HANDOFF] reason={reason.value}  "
+            f"text=\"{text[:80]}\"{_C['reset']}",
+            flush=True,
+        )
+
+    handoff_eval = HandoffEvaluator(on_trigger=_log_handoff)
+
+    # --- Latency instrumentation (writes logs/latency.jsonl) ---
+    latency_tracker = LatencyTracker(
+        session_id=session_id,
+        log_path=Path(__file__).resolve().parents[2] / "logs" / "latency.jsonl",
+    )
+    latency_start = LatencyStartMark(latency_tracker)
+    latency_end = LatencyEndMark(latency_tracker)
+
     # --- Pipeline ---
     # debug sits after TTS so it sees every downstream frame:
     # VAD events, STT transcriptions, LLM text/tool calls, TTS boundaries.
@@ -244,9 +275,12 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
         transport.input(),
         vad,
         stt,
+        latency_start,
+        handoff_eval,
         context_aggregator.user(),
         llm,
         tts,
+        latency_end,
         debug,
         transport.output(),
         context_aggregator.assistant(),
@@ -271,6 +305,9 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     state = initial_state(session_id)
     state["language"] = lang
     flow_manager.state.update(state)
+
+    # Now that flow_manager exists, wire the handoff evaluator to it.
+    handoff_eval.flow_manager = flow_manager
 
     # --- Event handlers ---
     @transport.event_handler("on_client_connected")
