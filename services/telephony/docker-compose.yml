@@ -1,0 +1,25 @@
+services:
+  asterisk:
+    build: ./asterisk
+    container_name: agent-asterisk
+    restart: unless-stopped
+    # Reliable UDP port publishing requires Docker Desktop for Mac to have
+    # "Use kernel networking for UDP" enabled (Settings → Resources → Network).
+    # Without it, vpnkit's userspace UDP proxy drops SIP reply packets.
+    # On Linux, port publishing works out of the box.
+    ports:
+      - "5060:5060/udp"
+      - "8089:8089/tcp"
+      - "10000-10100:10000-10100/udp"
+    environment:
+      FRITZBOX_HOST: ${FRITZBOX_HOST}
+      FRITZBOX_USER: ${FRITZBOX_USER}
+      FRITZBOX_PASS: ${FRITZBOX_PASS}
+      EXTERNAL_IP: ${EXTERNAL_IP}
+    # Bind-mount the config templates so we can iterate on pjsip.conf, extensions.conf,
+    # etc. without rebuilding the image. `docker compose restart` picks up changes.
+    volumes:
+      - ./asterisk/etc:/etc/asterisk-templates:ro
+    # Keep stdin/tty open so `asterisk -fvvvc` gives us the interactive console.
+    stdin_open: true
+    tty: true

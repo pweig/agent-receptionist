@@ -1,0 +1,68 @@
+; PJSIP configuration — register as an internal IP phone on the FritzBox.
+; Rendered from this template by entrypoint.sh (envsubst).
+; Required env vars: FRITZBOX_HOST, FRITZBOX_USER, FRITZBOX_PASS, EXTERNAL_IP
+
+[global]
+type=global
+user_agent=agent-receptionist
+
+[transport-udp]
+type=transport
+protocol=udp
+bind=0.0.0.0:5060
+; Asterisk runs inside a Docker bridge network (172.x). FritzBox on the LAN
+; reaches us only via Docker port publishing, so from Asterisk's POV FritzBox
+; is on an "external" network. local_net must list only the container's real
+; local networks — NOT the LAN — otherwise PJSIP skips NAT rewriting and
+; advertises the container's internal IP in Via/Contact headers.
+external_media_address=${EXTERNAL_IP}
+external_signaling_address=${EXTERNAL_IP}
+local_net=172.16.0.0/12
+local_net=10.0.0.0/8
+
+; ----- Outbound registration to FritzBox -----
+
+[fritzbox-reg]
+type=registration
+outbound_auth=fritzbox-auth
+server_uri=sip:${FRITZBOX_HOST}
+client_uri=sip:${FRITZBOX_USER}@${FRITZBOX_HOST}
+retry_interval=60
+expiration=300
+
+[fritzbox-auth]
+type=auth
+auth_type=userpass
+username=${FRITZBOX_USER}
+password=${FRITZBOX_PASS}
+
+; ----- Endpoint representing the FritzBox as a peer -----
+
+[fritzbox]
+type=aor
+contact=sip:${FRITZBOX_HOST}
+
+[fritzbox]
+type=endpoint
+transport=transport-udp
+context=incoming
+disallow=all
+allow=alaw
+outbound_auth=fritzbox-auth
+aors=fritzbox
+from_user=${FRITZBOX_USER}
+from_domain=${FRITZBOX_HOST}
+direct_media=no
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+
+[fritzbox-identify]
+type=identify
+endpoint=fritzbox
+match=${FRITZBOX_HOST}
+; Docker Desktop on Mac source-NATs inbound UDP from the Mac LAN (192.168.178.1)
+; to its internal gateway (192.168.65.1) before the packet reaches the container.
+; Matching this range lets identify resolve inbound INVITEs to the fritzbox endpoint.
+; On a native Linux deployment the source IP stays 192.168.178.1 and this range is harmless.
+match=192.168.65.0/24
