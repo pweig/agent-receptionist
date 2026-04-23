@@ -65,8 +65,8 @@ def _task(key: str) -> list[dict]:
 
 
 _GREETING_TEXT = {
-    "en": "Muster Dental Practice, this is Lena speaking, how can I help you?",
-    "de": "Zahnarztpraxis Muster, hier ist Lena, was kann ich für Sie tun?",
+    "en": "Am Limes Dental Practice, this is Thorsten Piper speaking, how can I help you?",
+    "de": "Zahnarztpraxis Am Limes, hier ist Thorsten Piper, was kann ich für Sie tun?",
 }
 
 

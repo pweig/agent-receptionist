@@ -4,7 +4,7 @@ This runbook covers the hands-on steps for M1 Task 1 of the [Phase 1 Build Plan]
 
 **Environment assumed:**
 - FritzBox 7362 SL at `192.168.178.1` (default)
-- Dev Mac at `192.168.178.197` on the same LAN
+- Dev Mac at `192.168.178.97` on the same LAN (verify with: `docker logs agent-asterisk | grep "received="` — use the IP shown there, not `ipconfig`)
 - Numbers available on FritzBox: `6190556` (Telekom), `38534` (Telekom), `999999999` (Poivy — leave alone)
 - Docker 29.x installed
 
@@ -44,17 +44,16 @@ Edit `.env`:
 FRITZBOX_HOST=192.168.178.1
 FRITZBOX_USER=receptionist
 FRITZBOX_PASS=<the password you set in Step 1.6>
-EXTERNAL_IP=192.168.178.197
+EXTERNAL_IP=192.168.178.97
 ```
 
-Verify `EXTERNAL_IP` matches your current LAN IP:
+**Important:** `EXTERNAL_IP` must be the IP that Docker actually routes outbound traffic through — not necessarily what `ipconfig getifaddr en0` returns. macOS can have multiple IPs on the same interface (aliases), and `ipconfig` may return one that Docker doesn't use. The authoritative way to find it:
 
 ```bash
-ipconfig getifaddr en0
-# → 192.168.178.197 (or whatever your current IP is)
+# Start Asterisk, wait for registration, then:
+docker logs agent-asterisk 2>&1 | grep "received=" | tail -1
+# The IP after received= is what FritzBox sees — use THAT as EXTERNAL_IP
 ```
-
-If you use WiFi instead of Ethernet, it may be `en1`.
 
 ---
 

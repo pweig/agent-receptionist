@@ -410,7 +410,11 @@ async def run_bot_sip(
 
 
 async def _sip_server_main() -> None:
-    host = os.environ.get("SIP_LISTEN_HOST", "0.0.0.0")
+    # Listen on both IPv4 and IPv6: host.docker.internal can resolve to either
+    # depending on Docker Desktop's DNS query order. If we only bind 0.0.0.0
+    # (IPv4) and Asterisk's AudioSocket app connects via IPv6, the connection
+    # is silently refused and the caller hears dead air.
+    host = os.environ.get("SIP_LISTEN_HOST", "")  # "" → all interfaces, both families
     port = int(os.environ.get("SIP_LISTEN_PORT", 8089))
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
