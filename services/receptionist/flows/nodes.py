@@ -408,13 +408,17 @@ def create_intent_node() -> NodeConfig:
                 name="set_intent",
                 description=(
                     "Signal the caller's intent after asking how you can help. "
-                    "Use 'booking' for new appointments; 'other' for everything else."
+                    "Use 'booking' for new appointments, 'reschedule' to change an existing "
+                    "appointment, 'cancel' to cancel one, 'other' for everything else."
                 ),
                 properties={
                     "intent": {
                         "type": "string",
-                        "enum": ["booking", "other"],
-                        "description": "'booking' to proceed with new appointment, 'other' to transfer.",
+                        "enum": ["booking", "reschedule", "cancel", "other"],
+                        "description": (
+                            "'booking' for a new appointment, 'reschedule' to move an existing one, "
+                            "'cancel' to cancel one, 'other' to transfer to a human."
+                        ),
                     }
                 },
                 required=["intent"],
