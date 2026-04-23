@@ -9,8 +9,10 @@ services:
     # On Linux, port publishing works out of the box.
     ports:
       - "5060:5060/udp"
-      - "8089:8089/tcp"
       - "10000-10100:10000-10100/udp"
+    # Note: we do NOT publish 8089 — Asterisk dials out to the host's
+    # AudioSocket listener (host.docker.internal:8089), which runs in the
+    # Pipecat process on the Mac. Publishing 8089 would collide with it.
     environment:
       FRITZBOX_HOST: ${FRITZBOX_HOST}
       FRITZBOX_USER: ${FRITZBOX_USER}

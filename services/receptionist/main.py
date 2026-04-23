@@ -1,17 +1,23 @@
 """
-Phase 0 POC — Dental Office Voice Receptionist
-Pipecat pipeline: SmallWebRTC (browser) → VAD → Whisper STT → Groq LLM → Piper TTS → SmallWebRTC
+Dental Office Voice Receptionist — Pipecat pipeline entry point.
 
-No external accounts needed — runs entirely on localhost.
+Two transports share the same pipeline:
 
-Usage:
-    make dev        # starts on http://localhost:7860
-    Open http://localhost:7860 in a browser, click "Start Call"
+    TRANSPORT=webrtc  (default)  → FastAPI + SmallWebRTC for the browser demo
+                                   (``make dev`` → http://localhost:7860)
+
+    TRANSPORT=sip                → asyncio TCP server on :8089 speaking
+                                   Asterisk's AudioSocket protocol
+                                   (real phone calls via FritzBox + Asterisk)
+
+The middle of the pipeline — VAD, Whisper, LLM, Piper, FlowManager — is built
+in ``_build_pipeline()`` and is identical between the two paths.
 """
 
 import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
@@ -44,8 +50,8 @@ from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.piper.tts import PiperTTSService
-from pipecat.services.whisper.stt import WhisperSTTService, Model
-from pipecat.transports.base_transport import TransportParams
+from pipecat.services.whisper.stt import Model, WhisperSTTService
+from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.request_handler import (
     SmallWebRTCPatchRequest,
@@ -55,7 +61,12 @@ from pipecat.transports.smallwebrtc.request_handler import (
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_flows import FlowManager
 
-from .flows.nodes import create_get_office_hours_schema, create_greeting_node, create_set_language_schema
+from .audiosocket_transport import AudioSocketParams, AudioSocketTransport
+from .flows.nodes import (
+    create_get_office_hours_schema,
+    create_greeting_node,
+    create_set_language_schema,
+)
 from .processors import (
     HandoffEvaluator,
     LatencyEndMark,
@@ -143,6 +154,7 @@ class DebugFrameLogger(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
+
 load_dotenv()
 
 _CONFIG_DIR = Path(__file__).parent / "config"
@@ -151,7 +163,9 @@ _STATIC_DIR = Path(__file__).parent / "static"
 _bot_tasks: set[asyncio.Task] = set()
 
 
-from contextlib import asynccontextmanager
+# ---------------------------------------------------------------------------
+# FastAPI app (WebRTC path)
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
@@ -181,39 +195,50 @@ def _load_settings() -> dict:
         return yaml.safe_load(f)
 
 
-async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
+def _resolve_language() -> str:
+    """Language is pinned at startup via OFFICE_LOCALE ("de" default)."""
+    locale = os.environ.get("OFFICE_LOCALE", "de").lower()
+    return "de" if locale == "de" else "en"
+
+
+# ---------------------------------------------------------------------------
+# Shared pipeline builder — transport-agnostic
+# ---------------------------------------------------------------------------
+
+
+async def _build_pipeline(
+    transport: BaseTransport,
+    session_id: str,
+    lang: str,
+) -> tuple[PipelineTask, FlowManager]:
+    """Assemble the receptionist pipeline around a given transport.
+
+    Returns the PipelineTask (pass to a PipelineRunner) and the FlowManager
+    (call ``initialize()`` on it once the transport is ready).
+    """
     settings = _load_settings()
-    session_id = str(uuid.uuid4())
 
-    # Language is determined by OFFICE_LOCALE at startup ("de" or anything else → "en").
-    # The TTS voice, initial state, and greeting are all set from this value.
-    _locale = os.environ.get("OFFICE_LOCALE", "de").lower()
-    lang = "de" if _locale == "de" else "en"
-
-    # --- Transport (SmallWebRTC — no external account needed) ---
-    transport = SmallWebRTCTransport(
-        webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-        ),
-    )
-
-    # --- VAD (pipeline processor; not built into SmallWebRTC like it was in Daily) ---
+    # --- VAD ---
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(stop_secs=settings["vad"]["stop_secs"])
         )
     )
 
-    # --- STT: faster-whisper. Subclass forwards info.language_probability
-    # via TranscriptionFrame.result so HandoffEvaluator can trigger on LOW_STT_CONFIDENCE.
+    # --- STT: faster-whisper with language-probability forwarding ---
     _model_raw = os.environ.get("WHISPER_MODEL", settings["stt"]["model"])
     _model_key = _model_raw.upper().replace("-", "_")
     _whisper_model_str = Model[_model_key].value
+    # Lock Whisper to the call's configured language (from OFFICE_LOCALE).
+    # Auto-detection on 8 kHz phone audio is unreliable — a caller saying "Ich
+    # möchte einen Termin" gets mis-detected as English and the word "Termin"
+    # comes out as "termine" / "Kermin". Pinning the language is a free win
+    # because the locale is already fixed at startup.
+    whisper_language = "de" if lang == "de" else "en"
     stt = WhisperSTTWithConfidence(
         settings=WhisperSTTService.Settings(
             model=_whisper_model_str,
+            language=whisper_language,
             no_speech_prob=settings["stt"]["no_speech_prob"],
         ),
         device=settings["stt"]["device"],
@@ -242,15 +267,10 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     context = LLMContext()
     context_aggregator = LLMContextAggregatorPair(context)
 
-    # --- Debug observer (always on for POC; remove in production) ---
+    # --- Debug observer ---
     debug = DebugFrameLogger()
 
-    # --- Handoff evaluator ---
-    # Runs evaluate_handoff() on every caller transcription. On a trigger match
-    # (medical question, billing dispute, low STT confidence for 2+ turns, etc.)
-    # it forces a transition to the handoff node — the "eager handoff" safety net
-    # from Phase 1 of the brief. flow_manager is attached after construction
-    # because it depends on PipelineTask.
+    # --- Handoff evaluator (flow_manager attached after construction) ---
     def _log_handoff(reason, text: str) -> None:
         print(
             f"{_C['magenta']}[AUTO-HANDOFF] reason={reason.value}  "
@@ -260,7 +280,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
 
     handoff_eval = HandoffEvaluator(on_trigger=_log_handoff)
 
-    # --- Event log (turn_latency + handoffs + completions — writes logs/events.jsonl) ---
+    # --- Event log (turn latency, handoffs, completions → logs/events.jsonl) ---
     event_log_path = Path(__file__).resolve().parents[2] / "logs" / "events.jsonl"
     latency_tracker = LatencyTracker(
         session_id=session_id,
@@ -269,9 +289,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     latency_start = LatencyStartMark(latency_tracker)
     latency_end = LatencyEndMark(latency_tracker)
 
-    # --- Pipeline ---
-    # debug sits after TTS so it sees every downstream frame:
-    # VAD events, STT transcriptions, LLM text/tool calls, TTS boundaries.
     pipeline = Pipeline([
         transport.input(),
         vad,
@@ -296,7 +313,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
         idle_timeout_secs=300,
     )
 
-    # --- FlowManager ---
     flow_manager = FlowManager(
         task=task,
         llm=llm,
@@ -305,14 +321,33 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     )
     state = initial_state(session_id)
     state["language"] = lang
-    # Expose telemetry hook to node handlers via flow_manager.state.
     state["event_log_path"] = event_log_path
     flow_manager.state.update(state)
 
-    # Now that flow_manager exists, wire the handoff evaluator to it.
     handoff_eval.flow_manager = flow_manager
 
-    # --- Event handlers ---
+    return task, flow_manager
+
+
+# ---------------------------------------------------------------------------
+# WebRTC path (browser demo)
+# ---------------------------------------------------------------------------
+
+
+async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
+    lang = _resolve_language()
+    session_id = str(uuid.uuid4())
+
+    transport = SmallWebRTCTransport(
+        webrtc_connection,
+        params=TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    )
+
+    task, flow_manager = await _build_pipeline(transport, session_id, lang)
+
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         await flow_manager.initialize(create_greeting_node(lang))
@@ -321,7 +356,6 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
     async def on_client_disconnected(transport, client):
         await task.cancel()
 
-    # --- Run ---
     # handle_sigint=False: let uvicorn own SIGINT. Multiple runners each
     # installing their own handler fight with uvicorn and block Ctrl+C.
     runner = PipelineRunner(handle_sigint=False)
@@ -329,8 +363,84 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SIP path (Asterisk AudioSocket)
+# ---------------------------------------------------------------------------
+
+
+async def run_bot_sip(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+    lang = _resolve_language()
+    session_id = str(uuid.uuid4())
+
+    transport = AudioSocketTransport(
+        reader,
+        writer,
+        params=AudioSocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+        ),
+    )
+
+    task, flow_manager = await _build_pipeline(transport, session_id, lang)
+
+    async def _kickoff():
+        # The SIP "client" is already on the other end of the TCP socket when
+        # we get here — there is no on_client_connected event like on WebRTC.
+        # Wait until the pipeline has processed its StartFrame, then push the
+        # greeting so Piper actually has a live transport to speak through.
+        await transport.wait_until_pipeline_started()
+        await flow_manager.initialize(create_greeting_node(lang))
+
+    async def _watch_disconnect():
+        await transport.wait_until_disconnected()
+        await task.cancel()
+
+    kickoff_task = asyncio.create_task(_kickoff())
+    disconnect_task = asyncio.create_task(_watch_disconnect())
+
+    runner = PipelineRunner(handle_sigint=False)
+    try:
+        await runner.run(task)
+    finally:
+        for t in (kickoff_task, disconnect_task):
+            if not t.done():
+                t.cancel()
+
+
+async def _sip_server_main() -> None:
+    host = os.environ.get("SIP_LISTEN_HOST", "0.0.0.0")
+    port = int(os.environ.get("SIP_LISTEN_PORT", 8089))
+
+    async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        peer = writer.get_extra_info("peername")
+        print(f"[AudioSocket] connection from {peer}", flush=True)
+        bot_task = asyncio.create_task(run_bot_sip(reader, writer))
+        _bot_tasks.add(bot_task)
+        bot_task.add_done_callback(_bot_tasks.discard)
+        try:
+            await bot_task
+        except Exception as exc:
+            print(f"[AudioSocket] pipeline error: {exc!r}", flush=True)
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            print(f"[AudioSocket] connection from {peer} closed", flush=True)
+
+    server = await asyncio.start_server(_handle, host=host, port=port)
+    print(f"  AudioSocket listening on {host}:{port}\n", flush=True)
+    async with server:
+        await server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
 # FastAPI routes — WebRTC signaling
 # ---------------------------------------------------------------------------
+
 
 @app.post("/api/offer")
 async def offer(request: SmallWebRTCRequest):
@@ -356,7 +466,19 @@ async def index():
     return HTMLResponse((_STATIC_DIR / "index.html").read_text())
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def main():
+    transport_mode = os.environ.get("TRANSPORT", "webrtc").lower()
+
+    if transport_mode == "sip":
+        print("  Starting in SIP / AudioSocket mode.", flush=True)
+        asyncio.run(_sip_server_main())
+        return
+
     import uvicorn
 
     port = int(os.environ.get("PORT", 7860))

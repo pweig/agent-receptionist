@@ -64,17 +64,17 @@ def _task(key: str) -> list[dict]:
     return [{"role": "system", "content": STATE_TASK_MESSAGES[key]}]
 
 
-_GREETINGS = {
-    "en": 'Say: "Muster Dental Practice, this is Lena speaking, how can I help you?"',
-    "de": 'Say: "Zahnarztpraxis Muster, hier ist Lena, was kann ich für Sie tun?"',
+_GREETING_TEXT = {
+    "en": "Muster Dental Practice, this is Lena speaking, how can I help you?",
+    "de": "Zahnarztpraxis Muster, hier ist Lena, was kann ich für Sie tun?",
 }
 
 
 def _greeting_task(lang: str) -> str:
-    greeting = _GREETINGS.get(lang, _GREETINGS["en"])
+    greeting = _GREETING_TEXT.get(lang, _GREETING_TEXT["en"])
     return (
-        f"{greeting}\n"
-        f"After the caller responds, call set_language(\"{lang}\") to continue.\n"
+        f'Say exactly: "{greeting}"\n'
+        f'After the caller responds, call set_language("{lang}") to continue.\n'
         "Do not ask for their name yet."
     )
 

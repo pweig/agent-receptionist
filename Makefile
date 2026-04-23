@@ -1,4 +1,4 @@
-.PHONY: setup dev install lint
+.PHONY: setup dev dev-sip install lint
 
 PYTHON := python3
 VENV   := .venv
@@ -30,6 +30,17 @@ dev:
 	@echo "  Open http://localhost:7860 in your browser and click Start Call."
 	@echo ""
 	$(RUN) -m services.receptionist.main
+
+# Run the agent in SIP mode — AudioSocket listener on :8089 for Asterisk to connect.
+# Requires services/telephony/ Asterisk container to be up and registered with
+# the FritzBox. See docs/phase1-m1-fritzbox-setup.md.
+dev-sip:
+	@echo ""
+	@echo "  Starting agent in SIP mode — AudioSocket listener on :8089"
+	@echo "  Asterisk (services/telephony/) must be running and a call routed"
+	@echo "  to the receptionist number on the FritzBox."
+	@echo ""
+	TRANSPORT=sip $(RUN) -m services.receptionist.main
 
 # Install only (no model download)
 install:
