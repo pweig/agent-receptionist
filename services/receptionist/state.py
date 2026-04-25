@@ -68,6 +68,8 @@ def initial_state(session_id: str) -> dict:
         "session_id": session_id,
         "language": None,                     # Language enum, set at LANGUAGE_DETECT
         "current_state": ConversationState.GREETING,
+        "consent_given": None,                # True/False once record_consent is called
+        "consent_timestamp": None,            # ISO-8601 timestamp of the consent decision
         "info": CollectedInfo(),
         "patient_record": None,               # result of search_patient
         "proposed_slots": [],                 # result of get_available_slots

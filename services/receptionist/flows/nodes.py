@@ -7,7 +7,9 @@ naturally have no tools use lightweight "transition" functions that the LLM call
 to signal intent (e.g., set_language, set_intent, select_slot, complete_handoff).
 
 Flow:
-  greeting ──set_language──► hours_check ──get_office_hours──► intent / closing
+  (pipeline start) ──► consent  [two pre-roll tts_say clips: greeting, consent notice]
+  consent ──record_consent(true)──► hours_check ──get_office_hours──► intent / closing
+  consent ──record_consent(false)──► handoff
   intent ──set_intent("booking")──► collect_info
   intent ──set_intent("reschedule"|"cancel")──► manage_appointment
   intent ──set_intent("other")──► handoff
@@ -27,8 +29,8 @@ from __future__ import annotations
 from pipecat.frames.frames import TTSUpdateSettingsFrame
 from pipecat_flows import FlowManager, FlowsFunctionSchema, NodeConfig
 
-from ..prompt import PERSONA_SYSTEM_PROMPT, STATE_TASK_MESSAGES
-from ..telemetry import log_from_flow_manager
+from ..prompt import PERSONA_SYSTEM_PROMPT, PREROLL_CONSENT, PREROLL_GREETING, STATE_TASK_MESSAGES
+from ..telemetry import append_event, log_from_flow_manager
 from ..tools.pms_mock import (
     book_appointment,
     cancel_appointment,
@@ -64,21 +66,6 @@ def _task(key: str) -> list[dict]:
     return [{"role": "system", "content": STATE_TASK_MESSAGES[key]}]
 
 
-_GREETING_TEXT = {
-    "en": "Am Limes Dental Practice, this is Thorsten Piper speaking, how can I help you?",
-    "de": "Zahnarztpraxis Am Limes, hier ist Thorsten Piper, was kann ich für Sie tun?",
-}
-
-
-def _greeting_task(lang: str) -> str:
-    greeting = _GREETING_TEXT.get(lang, _GREETING_TEXT["en"])
-    return (
-        f'Say exactly: "{greeting}"\n'
-        f'After the caller responds, call set_language("{lang}") to continue.\n'
-        "Do not ask for their name yet."
-    )
-
-
 def _fn(name: str, description: str, properties: dict, required: list, handler) -> FlowsFunctionSchema:
     return FlowsFunctionSchema(
         name=name,
@@ -87,6 +74,29 @@ def _fn(name: str, description: str, properties: dict, required: list, handler) 
         required=required,
         handler=handler,
     )
+
+
+# ---------------------------------------------------------------------------
+# Handlers — consent
+# ---------------------------------------------------------------------------
+
+async def _handle_record_consent(args: dict, flow_manager: FlowManager):
+    given = bool((args or {}).get("given", False))
+    from pipecat.utils.time import time_now_iso8601
+    ts = time_now_iso8601()
+    flow_manager.state["consent_given"] = given
+    flow_manager.state["consent_timestamp"] = ts
+    append_event(
+        log_path=flow_manager.state.get("event_log_path"),
+        session_id=flow_manager.state.get("session_id", "unknown"),
+        event="consent",
+        consent_given=given,
+        caller_id=flow_manager.state.get("caller_id"),
+    )
+    if not given:
+        flow_manager.state["handoff_reason"] = "consent_declined"
+        return {"consent": "declined"}, create_handoff_node()
+    return {"consent": "given"}, create_hours_check_node()
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +264,12 @@ async def _handle_send_confirmation(args: dict, flow_manager: FlowManager):
 # ---------------------------------------------------------------------------
 
 async def _handle_set_language(args: dict, flow_manager: FlowManager):
+    """Update TTS voice to match detected/requested language.
+
+    Registered as a global function so the LLM can switch voices mid-call if
+    the caller code-switches. Never triggers a flow transition — the entry
+    point is the consent node (set up directly by main.py after pre-roll TTS).
+    """
     lang = (args or {}).get("language", "en")
     if lang not in TTS_VOICES:
         lang = "en"
@@ -261,9 +277,6 @@ async def _handle_set_language(args: dict, flow_manager: FlowManager):
     await flow_manager.task.queue_frame(
         TTSUpdateSettingsFrame(settings={"voice": TTS_VOICES[lang]})
     )
-    # Only advance to hours_check from the greeting node; elsewhere just update the voice.
-    if flow_manager.current_node == "greeting":
-        return {"language_set": lang}, create_hours_check_node()
     return {"language_set": lang}, None
 
 
@@ -371,7 +384,17 @@ def create_get_office_hours_schema() -> FlowsFunctionSchema:
     )
 
 
-def create_greeting_node(lang: str = "en") -> NodeConfig:
+
+
+def create_consent_node(lang: str = "de") -> NodeConfig:
+    """Entry node for every call.
+
+    Pre-roll tts_say actions play the greeting, then the DSGVO consent notice,
+    before the LLM is ever invoked. `respond_immediately: False` keeps the LLM
+    silent until the caller actually speaks — the first caller utterance is
+    expected to be Ja/Nein, and the LLM's job here is just to call
+    record_consent with that answer.
+    """
     lang_desc = "German (always use formal 'Sie' address)" if lang == "de" else "English"
     lang_msg = {
         "role": "system",
@@ -381,11 +404,35 @@ def create_greeting_node(lang: str = "en") -> NodeConfig:
             "Do not switch languages under any circumstances."
         ),
     }
+    greeting_text = PREROLL_GREETING.get(lang, PREROLL_GREETING["en"])
+    consent_text = PREROLL_CONSENT.get(lang, PREROLL_CONSENT["en"])
     return {
-        "name": "greeting",
+        "name": "consent",
         "role_messages": _role() + [lang_msg],
-        "task_messages": [{"role": "system", "content": _greeting_task(lang)}],
-        "functions": [],
+        "task_messages": _task("consent"),
+        "functions": [
+            _fn(
+                name="record_consent",
+                description=(
+                    "Record whether the caller has given or declined consent to automated "
+                    "processing. Call this immediately after the caller answers Ja/Yes or "
+                    "Nein/No to the consent notice."
+                ),
+                properties={
+                    "given": {
+                        "type": "boolean",
+                        "description": "true if the caller agreed, false if they declined.",
+                    }
+                },
+                required=["given"],
+                handler=_handle_record_consent,
+            ),
+        ],
+        "pre_actions": [
+            {"type": "tts_say", "text": greeting_text},
+            {"type": "tts_say", "text": consent_text},
+        ],
+        "respond_immediately": False,
     }
 
 

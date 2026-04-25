@@ -60,28 +60,43 @@
 - [ ] LLM API calls: either (a) EU endpoint with AVV or (b) self-hosted on EU infrastructure
 
 ### Consent (Einwilligung)
-- [ ] German consent prompt plays before any audio is captured:
-  - *"Dieses Gespräch kann aufgezeichnet werden. Mit der weiteren Nutzung stimmen Sie zu."*
-  - Alternative: two-step consent with keypress confirmation
-  - Log: session_id, timestamp, consent_given=true
-- [ ] Callers who decline are transferred to a human immediately
+- [x] German consent prompt plays before any audio is captured (M2 — T1):
+  - *"Dieses Gespräch wird zum Zweck der Terminvereinbarung automatisch verarbeitet. Sind Sie damit einverstanden?"*
+  - Implemented as `consent` flow node; LLM calls `record_consent(given=bool)`
+  - Log: session_id, timestamp, consent_given (see `events.jsonl` `consent` event)
+- [x] Callers who decline are transferred to a human immediately (M2 — T1):
+  - `record_consent(given=false)` → `create_handoff_node()` with reason `consent_declined`
 
 ### Data subject rights
 - [ ] Right to erasure (Art. 17 DSGVO): documented process to delete caller audio/transcript on request
 - [ ] Right to access (Art. 15): process to provide transcript copy on request
 - [ ] Right to rectification (Art. 16): process to correct appointment records
 
+### PII handling in logs
+- [x] STT transcriptions redacted before writing to logs (M2 — T2):
+  - `privacy.redact()` replaces dates (→ `[DOB]`) and phone numbers (→ `[PHONE]`)
+  - `LOG_PII=false` (default): raw STT text never written to `events.jsonl`
+  - `LOG_PII=true` only for local dev/debugging; never in production
+- [x] Retention policy enforced (M2 — T6):
+  - `events.jsonl` lines older than `LOG_RETENTION_DAYS` (default 30 days) removed by `make purge-old-logs`
+  - Raw call captures (`logs/captures/*.raw`) purged after `CAPTURE_RETENTION_DAYS` (default 7 days)
+
 ### Documentation
 - [ ] Datenschutzerklärung (Privacy Notice) updated to include AI voice processing
-- [ ] Verzeichnis der Verarbeitungstätigkeiten (Records of Processing Activities) updated
-  - Processing purpose: appointment scheduling
-  - Data categories: voice, name, DOB, phone, insurance type
-  - Retention: [X] days
-  - Recipients: internal PMS system; no third-party marketing
+- [x] Art. 30 Verarbeitungsverzeichnis entry (M2):
+  - **Verantwortlicher:** Zahnarztpraxis Am Limes
+  - **Verarbeitungszweck:** Automatisierte Terminvereinbarung per Telefon (Art. 6 Abs. 1 lit. b DSGVO)
+  - **Datenkategorien:** Stimme (Audiodaten), Name, Geburtsdatum, Telefonnummer, Kassenart (GKV/PKV)
+  - **Aufbewahrungsfrist:** Ereignisprotokoll 30 Tage, Aufnahme-Rohdaten 7 Tage
+  - **Empfänger:** Internes Praxisverwaltungssystem; keine Weitergabe zu Marketingzwecken
+  - **Technische Schutzmaßnahmen:** PII-Redaktion in Logs, Zustimmungspflicht vor Verarbeitung
 - [ ] DPIA (Datenschutz-Folgenabschätzung) conducted if practice has > 250 employees
   or processes sensitive health data at scale (Art. 35 DSGVO + Art. 9)
-- [ ] Art. 22 DSGVO (automated decision-making): appointment booking by AI is not a
-  "significant decision" in the Art. 22 sense — document this assessment
+- [x] Art. 22 DSGVO assessment (M2):
+  - Appointment booking by the AI is **not** an automated decision with significant legal
+    effect on the data subject (Art. 22 Abs. 1). The AI schedules time slots in a practice
+    management system; a human receptionist or dentist retains control over actual treatment
+    decisions. No profiling or scoring of patients occurs. Art. 22 does not apply.
 
 ### TTS German language validation
 - [ ] Validated Piper `de_DE-thorsten-high` pronunciation for the following:

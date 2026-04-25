@@ -1,9 +1,12 @@
 """
 Mock Practice Management System (PMS) implementations.
-In-memory data only — swap these with real PMS adapters (Dampsoft, Dentrix, etc.)
-in Phase 1 without changing the calling interface.
+Appointments and booked slots are persisted to data/pms.json so they survive
+server restarts — reschedule/cancel calls work across sessions.
+Swap with real PMS adapters (Dampsoft, Dentrix, etc.) without changing the
+calling interface.
 """
 
+import json
 import os
 import re
 import uuid
@@ -14,6 +17,7 @@ from typing import Optional
 import yaml
 
 _CONFIG_PATH = Path(__file__).parent.parent / "config" / "office_hours.yaml"
+_DB_PATH = Path(__file__).parent.parent / "data" / "pms.json"
 
 # ---------------------------------------------------------------------------
 # In-memory patient database
@@ -102,17 +106,51 @@ _PATIENTS: dict[str, dict] = {
     },
 }
 
-# Booked slot IDs (prevents double-booking within a session)
+# Booked slot IDs (prevents double-booking).  Derived from _APPOINTMENTS on load.
 _BOOKED_SLOTS: set[str] = set()
 
 # Confirmed appointments — keyed by confirmation_id.
 _APPOINTMENTS: dict[str, dict] = {}
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def _save_db() -> None:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_DB_PATH, "w") as f:
+        json.dump(
+            {"patients": _PATIENTS, "appointments": _APPOINTMENTS, "booked_slots": list(_BOOKED_SLOTS)},
+            f,
+            indent=2,
+        )
+
+
+def _load_db() -> None:
+    """Load persisted state from disk; seed demo data only on first run."""
+    if _DB_PATH.exists():
+        with open(_DB_PATH) as f:
+            data = json.load(f)
+        # Patients key absent in files created before this feature — keep static seed.
+        loaded_patients = data.get("patients", {})
+        if loaded_patients:
+            _PATIENTS.clear()
+            _PATIENTS.update(loaded_patients)
+        _APPOINTMENTS.update(data.get("appointments", {}))
+        _BOOKED_SLOTS.update(data.get("booked_slots", []))
+        if not loaded_patients:
+            _save_db()  # backfill patients into the existing file
+    else:
+        _seed_demo_appointments()
+        _save_db()
+
+
 def _seed_demo_appointments() -> None:
     """Pre-populate a few upcoming appointments so the reschedule/cancel flow
-    has something to act on during manual POC testing. Reset by the
-    reset_pms_state fixture in tests/conftest.py."""
+    has something to act on during manual POC testing. Called only when no
+    persisted DB file exists yet. Reset by the reset_pms_state fixture in
+    tests/conftest.py."""
     today = date.today()
     demo = [
         # Thomas Müller — checkup 3 days out at 10:00
@@ -140,7 +178,7 @@ def _seed_demo_appointments() -> None:
         _BOOKED_SLOTS.add(slot_id)
 
 
-_seed_demo_appointments()
+_load_db()
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +280,39 @@ async def search_patient(name: str, dob: Optional[str] = None) -> dict:
     # Multiple matches without disambiguating DOB
     candidates = [{"id": p["id"], "full_name": p["full_name"], "dob": p["dob"]} for p in matches]
     return {"status": "multiple", "candidates": candidates}
+
+
+async def create_patient(
+    full_name: str,
+    dob: str,
+    phone: str,
+    insurance: str = "",
+    insurance_type: str = "",
+    notes: str = "",
+) -> dict:
+    """
+    Register a new patient and persist the record.
+
+    Returns:
+        {"status": "created", "patient": {...}}
+    """
+    new_id = f"P{len(_PATIENTS) + 1:03d}"
+    while new_id in _PATIENTS:
+        new_id = f"P{int(new_id[1:]) + 1:03d}"
+
+    patient = {
+        "id": new_id,
+        "full_name": full_name,
+        "dob": dob,
+        "phone": phone,
+        "insurance": insurance,
+        "insurance_type": insurance_type,
+        "is_new": True,
+        "notes": notes,
+    }
+    _PATIENTS[new_id] = patient
+    _save_db()
+    return {"status": "created", "patient": patient}
 
 
 async def get_available_slots(
@@ -355,6 +426,7 @@ async def book_appointment(
         "booked_at": datetime.now().isoformat(),
     }
     _APPOINTMENTS[confirmation_id] = appointment
+    _save_db()
 
     return {"status": "confirmed", "confirmation_id": confirmation_id, "appointment": appointment}
 
@@ -433,6 +505,7 @@ async def cancel_appointment(confirmation_id: str) -> dict:
     slot_id = appt.get("slot_id")
     if slot_id:
         _BOOKED_SLOTS.discard(slot_id)
+    _save_db()
     return {"status": "cancelled", "appointment": appt}
 
 
@@ -465,6 +538,7 @@ async def reschedule_appointment(confirmation_id: str, new_slot_id: str) -> dict
         appt["datetime_iso"] = slot_dt.isoformat()
     appt["slot_id"] = new_slot_id
     appt["rescheduled_at"] = datetime.now().isoformat()
+    _save_db()
 
     return {"status": "rescheduled", "appointment": appt}
 

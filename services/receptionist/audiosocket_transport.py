@@ -70,10 +70,15 @@ class AudioSocketParams(TransportParams):
 
     audio_out_sample_rate defaults to 8000 so Pipecat resamples TTS output
     directly to Asterisk's rate and we can write bytes straight to the socket.
+
+    capture_path, when set, receives the raw 8 kHz SLIN16 audio from Asterisk
+    as a flat PCM file. Enabled via CAPTURE_CALLS=true in .env. Convert to WAV
+    with `make convert-captures`.
     """
 
     audio_in_sample_rate: Optional[int] = 16000
     audio_out_sample_rate: Optional[int] = ASTERISK_SAMPLE_RATE
+    capture_path: Optional[str] = None   # absolute path for raw PCM capture
 
 
 class _FrameStream:
@@ -164,6 +169,15 @@ class AudioSocketInputTransport(BaseInputTransport):
 
     async def _reader_loop(self):
         logger.info("AudioSocket reader loop started")
+        capture_file = None
+        if self._params.capture_path:
+            try:
+                import os
+                os.makedirs(os.path.dirname(self._params.capture_path), exist_ok=True)
+                capture_file = open(self._params.capture_path, "wb")
+                logger.info(f"Capturing raw audio to {self._params.capture_path}")
+            except Exception as exc:
+                logger.warning(f"Could not open capture file: {exc!r}")
         try:
             while True:
                 msg = await self._stream.read_message()
@@ -174,6 +188,8 @@ class AudioSocketInputTransport(BaseInputTransport):
                 kind, payload = msg
 
                 if kind == KIND_AUDIO:
+                    if capture_file is not None:
+                        capture_file.write(payload)
                     # SLIN 8 kHz mono 16-bit → 16 kHz for the pipeline.
                     pcm16k = await self._resampler.resample(
                         payload, ASTERISK_SAMPLE_RATE, self.sample_rate
@@ -205,6 +221,11 @@ class AudioSocketInputTransport(BaseInputTransport):
         except Exception as exc:
             logger.error(f"AudioSocket reader loop error: {exc!r}")
         finally:
+            if capture_file is not None:
+                try:
+                    capture_file.close()
+                except Exception:
+                    pass
             # Signal the output side to stop pacing and shut the pipeline down.
             await self._transport.on_peer_disconnected()
 
@@ -283,6 +304,25 @@ class AudioSocketOutputTransport(BaseOutputTransport):
                 await asyncio.sleep(sleep_for)
         return True
 
+    async def play_raw_wav_bytes(self, data: bytes) -> None:
+        """Write raw SLIN16 8 kHz audio bytes as AudioSocket frames at real-time pace.
+
+        Designed for emergency fallback playback after a pipeline crash — bypasses
+        the normal Pipecat frame pipeline entirely and writes directly to the socket.
+        `data` must already be 16-bit signed little-endian at 8 kHz (strip WAV header
+        before calling, or use the 44-byte standard WAV header offset).
+        """
+        FRAME_BYTES = 320  # 20 ms at 8 kHz SLIN16
+        for i in range(0, len(data), FRAME_BYTES):
+            chunk = data[i : i + FRAME_BYTES]
+            if len(chunk) < FRAME_BYTES:
+                chunk = chunk + b"\x00" * (FRAME_BYTES - len(chunk))
+            try:
+                await self._stream.write_message(KIND_AUDIO, chunk)
+            except Exception:
+                break
+            await asyncio.sleep(0.02)  # real-time pacing
+
     async def _hangup(self):
         try:
             await self._stream.write_message(KIND_HANGUP)
@@ -356,3 +396,17 @@ class AudioSocketTransport(BaseTransport):
         """Lets callers wait until the pipeline has processed its StartFrame
         (i.e. transport is ready) before pushing the initial flow frame."""
         await self._pipeline_started.wait()
+
+    async def play_fallback_and_hangup(self, pcm_data: bytes) -> None:
+        """Play raw SLIN16 8 kHz bytes then send a hangup frame.
+
+        Called directly after a pipeline crash to give the caller a graceful
+        farewell without going through the normal pipeline machinery.
+        """
+        if self._output:
+            await self._output.play_raw_wav_bytes(pcm_data)
+        try:
+            await self._stream.write_message(KIND_HANGUP)
+        except Exception:
+            pass
+        self._stream.close()

@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .env
 logs/
+services/receptionist/data/
 services/receptionist/models/
 *.onnx
 *.onnx.json

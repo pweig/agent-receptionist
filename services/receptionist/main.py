@@ -16,7 +16,10 @@ in ``_build_pipeline()`` and is identical between the two paths.
 
 import asyncio
 import os
+import time
+import traceback
 import uuid
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -62,9 +65,10 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat_flows import FlowManager
 
 from .audiosocket_transport import AudioSocketParams, AudioSocketTransport
+from .privacy import log_pii_enabled, redact
 from .flows.nodes import (
+    create_consent_node,
     create_get_office_hours_schema,
-    create_greeting_node,
     create_set_language_schema,
 )
 from .processors import (
@@ -74,6 +78,7 @@ from .processors import (
     LatencyTracker,
     WhisperSTTWithConfidence,
 )
+from .telemetry import log_call_end, log_call_start
 from .state import initial_state
 
 # ---------------------------------------------------------------------------
@@ -120,7 +125,11 @@ class DebugFrameLogger(FrameProcessor):
 
         elif isinstance(frame, TranscriptionFrame):
             lang = frame.language or "?"
-            print(f"{c['green']}[STT ] \"{frame.text}\"  lang={lang}{c['reset']}", flush=True)
+            if log_pii_enabled():
+                stt_text = f'"{frame.text}"'
+            else:
+                stt_text = f'"{redact(frame.text)}"'
+            print(f"{c['green']}[STT ] {stt_text}  lang={lang}{c['reset']}", flush=True)
 
         elif isinstance(frame, LLMFullResponseStartFrame):
             self._llm_buf = ""
@@ -161,6 +170,56 @@ _CONFIG_DIR = Path(__file__).parent / "config"
 _STATIC_DIR = Path(__file__).parent / "static"
 
 _bot_tasks: set[asyncio.Task] = set()
+
+# ---------------------------------------------------------------------------
+# Crash-recovery globals
+# ---------------------------------------------------------------------------
+
+_FALLBACK_AUDIO_PATH = Path(__file__).parent / "audio" / "fallback_de.wav"
+_FALLBACK_PCM: bytes = b""          # raw SLIN16 8 kHz audio, loaded once at startup
+
+# Monotonic timestamps (seconds) of recent SIP pipeline crashes.
+_crash_times: list[float] = []
+# Flipped to False after >3 crashes in 10 minutes; prevents a crash loop.
+_accepting_sip_connections: bool = True
+
+_CRASH_WINDOW_SECS = 600   # 10-minute rolling window
+_CRASH_LIMIT = 3           # max crashes before rejecting new calls
+
+
+def _load_fallback_audio() -> bytes:
+    """Load fallback_de.wav and return raw PCM bytes (WAV header stripped).
+
+    Returns empty bytes if the file does not exist yet (before gen-fallback
+    has been run). The crash handler degrades gracefully to hangup-only.
+    """
+    if not _FALLBACK_AUDIO_PATH.exists():
+        return b""
+    try:
+        with wave.open(str(_FALLBACK_AUDIO_PATH), "rb") as wf:
+            return wf.readframes(wf.getnframes())
+    except Exception as exc:
+        print(f"[WARN] Could not load fallback audio: {exc!r}", flush=True)
+        return b""
+
+
+def _record_crash() -> bool:
+    """Record a crash timestamp. Returns True if the crash limit is exceeded."""
+    global _accepting_sip_connections
+    now = time.monotonic()
+    _crash_times.append(now)
+    cutoff = now - _CRASH_WINDOW_SECS
+    while _crash_times and _crash_times[0] < cutoff:
+        _crash_times.pop(0)
+    if len(_crash_times) > _CRASH_LIMIT:
+        _accepting_sip_connections = False
+        print(
+            "CRITICAL: >3 pipeline crashes in 10 minutes — "
+            "refusing new SIP connections to prevent crash loop.",
+            flush=True,
+        )
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -350,16 +409,30 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        await flow_manager.initialize(create_greeting_node(lang))
+        await flow_manager.initialize(create_consent_node(lang))
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         await task.cancel()
 
+    event_log_path = flow_manager.state.get("event_log_path")
+    log_call_start(event_log_path, session_id)
+    call_start_mono = time.monotonic()
+
     # handle_sigint=False: let uvicorn own SIGINT. Multiple runners each
     # installing their own handler fight with uvicorn and block Ctrl+C.
     runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    try:
+        await runner.run(task)
+    finally:
+        log_call_end(
+            event_log_path,
+            session_id,
+            duration_secs=time.monotonic() - call_start_mono,
+            intent=flow_manager.state.get("intent"),
+            handoff=flow_manager.state.get("handoff_reason") is not None,
+            tool_errors=flow_manager.state.get("tool_error_count", 0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +447,19 @@ async def run_bot_sip(
     lang = _resolve_language()
     session_id = str(uuid.uuid4())
 
+    capture_path = None
+    if os.environ.get("CAPTURE_CALLS", "false").lower() in ("1", "true", "yes"):
+        captures_dir = Path(__file__).resolve().parents[2] / "logs" / "captures"
+        captures_dir.mkdir(parents=True, exist_ok=True)
+        capture_path = str(captures_dir / f"session_{session_id}.raw")
+
     transport = AudioSocketTransport(
         reader,
         writer,
         params=AudioSocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            capture_path=capture_path,
         ),
     )
 
@@ -391,7 +471,7 @@ async def run_bot_sip(
         # Wait until the pipeline has processed its StartFrame, then push the
         # greeting so Piper actually has a live transport to speak through.
         await transport.wait_until_pipeline_started()
-        await flow_manager.initialize(create_greeting_node(lang))
+        await flow_manager.initialize(create_consent_node(lang))
 
     async def _watch_disconnect():
         await transport.wait_until_disconnected()
@@ -400,16 +480,61 @@ async def run_bot_sip(
     kickoff_task = asyncio.create_task(_kickoff())
     disconnect_task = asyncio.create_task(_watch_disconnect())
 
+    event_log_path = flow_manager.state.get("event_log_path")
+    log_call_start(event_log_path, session_id)
+    call_start_mono = time.monotonic()
+
     runner = PipelineRunner(handle_sigint=False)
     try:
         await runner.run(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        tb_hash = hash(traceback.format_exc()) & 0xFFFFFFFF
+        print(
+            f"[CRASH] session={session_id} exc={exc!r} tb_hash={tb_hash:#010x}",
+            flush=True,
+        )
+        traceback.print_exc()
+        from .telemetry import append_event
+        append_event(
+            log_path=event_log_path,
+            session_id=session_id,
+            event="crash",
+            exc_type=type(exc).__name__,
+            traceback_hash=f"{tb_hash:#010x}",
+        )
+        _record_crash()
+        if _FALLBACK_PCM:
+            await transport.play_fallback_and_hangup(_FALLBACK_PCM)
     finally:
+        log_call_end(
+            event_log_path,
+            session_id,
+            duration_secs=time.monotonic() - call_start_mono,
+            intent=flow_manager.state.get("intent"),
+            handoff=flow_manager.state.get("handoff_reason") is not None,
+            tool_errors=flow_manager.state.get("tool_error_count", 0),
+        )
         for t in (kickoff_task, disconnect_task):
             if not t.done():
                 t.cancel()
 
 
 async def _sip_server_main() -> None:
+    global _FALLBACK_PCM
+    _FALLBACK_PCM = _load_fallback_audio()
+    if _FALLBACK_PCM:
+        print(
+            f"  Fallback audio loaded: {len(_FALLBACK_PCM)} bytes "
+            f"({len(_FALLBACK_PCM) / 16000:.1f}s at 8 kHz)",
+            flush=True,
+        )
+    else:
+        print(
+            "  [WARN] fallback_de.wav not found — run 'make gen-fallback' to generate it.",
+            flush=True,
+        )
     # Listen on both IPv4 and IPv6: host.docker.internal can resolve to either
     # depending on Docker Desktop's DNS query order. If we only bind 0.0.0.0
     # (IPv4) and Asterisk's AudioSocket app connects via IPv6, the connection
@@ -419,6 +544,17 @@ async def _sip_server_main() -> None:
 
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
+        if not _accepting_sip_connections:
+            print(
+                f"[AudioSocket] rejecting {peer} — crash limit reached; restart the process.",
+                flush=True,
+            )
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
         print(f"[AudioSocket] connection from {peer}", flush=True)
         bot_task = asyncio.create_task(run_bot_sip(reader, writer))
         _bot_tasks.add(bot_task)

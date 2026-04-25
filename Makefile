@@ -1,4 +1,4 @@
-.PHONY: setup dev dev-sip install lint
+.PHONY: setup dev dev-sip install lint gen-fallback convert-captures metrics purge-old-logs
 
 PYTHON := python3
 VENV   := .venv
@@ -41,6 +41,31 @@ dev-sip:
 	@echo "  to the receptionist number on the FritzBox."
 	@echo ""
 	TRANSPORT=sip $(RUN) -m services.receptionist.main
+
+# Generate the SIP crash-fallback audio clip.
+# Piper synth + soxr resample to 8 kHz SLIN16 (Asterisk AudioSocket format).
+# Run once after `make setup`.
+gen-fallback:
+	$(RUN) scripts/gen_fallback.py
+
+# Convert raw SLIN8 captures to WAV for playback and offline Whisper evaluation.
+# Requires ffmpeg in PATH. Reads logs/captures/*.raw
+convert-captures:
+	@echo "Converting captures in logs/captures/ ..."
+	@for f in logs/captures/*.raw; do \
+		out=$${f%.raw}.wav; \
+		ffmpeg -y -f s16le -ar 8000 -ac 1 -i "$$f" "$$out" && echo "  $$out"; \
+	done
+	@echo "Done."
+
+# Print a 1-page call quality summary from logs/events.jsonl
+metrics:
+	@$(RUN) scripts/metrics_report.py
+
+# Delete events.jsonl lines older than LOG_RETENTION_DAYS (default 30) and
+# raw captures older than CAPTURE_RETENTION_DAYS (default 7).
+purge-old-logs:
+	$(RUN) scripts/purge_logs.py
 
 # Install only (no model download)
 install:

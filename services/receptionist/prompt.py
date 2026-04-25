@@ -61,10 +61,52 @@ and trigger the handoff state.
 
 
 # ---------------------------------------------------------------------------
+# Pre-roll TTS clips played before the LLM pipeline takes over
+# ---------------------------------------------------------------------------
+#
+# These are queued as TTSSpeakFrame at pipeline start so the caller hears the
+# greeting and the DSGVO consent question synthesised via Piper, without the
+# LLM being involved. The caller's first STT'd utterance is therefore the
+# Ja/Nein answer to the consent question, and no voice input is processed
+# before consent is given.
+
+PREROLL_GREETING: dict[str, str] = {
+    "de": "Guten Tag, Zahnarztpraxis Am Limes, Thorsten Piper am Apparat.",
+    "en": "Am Limes Dental Practice, this is Thorsten Piper speaking.",
+}
+
+PREROLL_CONSENT: dict[str, str] = {
+    "de": (
+        "Bevor ich Ihnen helfen kann: dieses Gespräch wird zum Zweck der "
+        "Terminvereinbarung automatisch verarbeitet. "
+        "Sind Sie damit einverstanden? Bitte antworten Sie mit Ja oder Nein."
+    ),
+    "en": (
+        "Before I can help you: this call is processed automatically for "
+        "appointment scheduling. Do you agree? Please answer with Yes or No."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Per-state task messages (injected by FlowManager at each state transition)
 # ---------------------------------------------------------------------------
 
 STATE_TASK_MESSAGES: dict[str, str] = {
+
+    "consent": """\
+The greeting and consent question have JUST been played to the caller via pre-roll audio.
+You MUST stay completely silent until the caller speaks. Do NOT greet, acknowledge, introduce \
+yourself, or restate the consent question — all of that has already been spoken.
+
+Wait for the caller's response, then:
+  • "Ja" / "Yes" / clear agreement  → call record_consent(given=true)
+  • "Nein" / "No" / clear refusal   → call record_consent(given=false)
+  • Unclear or off-topic answer     → say exactly "Bitte antworten Sie mit Ja oder Nein." \
+(DE) or "Please answer with Yes or No." (EN), then wait again. Do NOT call record_consent yet.
+
+Output nothing else. Your only job in this state is to capture the Ja/Nein decision.
+""",
 
     "hours_check": """\
 Call get_office_hours immediately (no need to mention it to the caller).

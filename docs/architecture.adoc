@@ -137,9 +137,10 @@ skinparam backgroundColor #FEFEFE
 skinparam StateBackgroundColor #EEF4FF
 skinparam StateBorderColor #4466AA
 
-[*] --> greeting : on_client_connected\n(transport event)
+[*] --> consent : on_client_connected\n(transport event)\n\npre_actions [tts_say]:\n  1. greeting\n  2. consent notice
 
-greeting --> hours_check : set_language("en"|"de")\n[global fn — updates TTS voice]
+consent --> hours_check : record_consent(given=true)\n[logs consent event]
+consent --> handoff : record_consent(given=false)\n[reason: consent_declined]
 
 hours_check --> intent : get_office_hours()\nreturns open\n[global fn]
 hours_check --> closing : get_office_hours()\nreturns closed
@@ -176,6 +177,8 @@ closing --> [*] : end_conversation\n(post_action)
 ....
 
 NOTE: `set_language` and `get_office_hours` are registered as *global functions* on the `FlowManager` and are therefore available in every node. `transfer_to_human` is included explicitly in `intent`, `collect_info`, `slot_proposal`, `confirmation`, `manage_appointment`, and `reschedule_slot_proposal` nodes. It must NOT be called for reschedule or cancel — those are handled autonomously by `manage_appointment`.
+
+NOTE: The `consent` node (M2) is the pipeline's entry point. Two `pre_actions` of type `tts_say` play the greeting and the DSGVO consent question via Piper before the LLM is invoked, and `respond_immediately: False` keeps the LLM silent until the caller speaks. The first caller utterance is therefore the Ja/Nein answer, and `record_consent` is the only callable in the node. A `consent` event (session_id, timestamp, consent_given) is written to `events.jsonl` regardless of the outcome.
 
 NOTE: "auto-trigger" refers to the `HandoffEvaluator` frame processor (see Section 9). It runs `evaluate_handoff()` on every caller transcription and calls `FlowManager.set_node_from_config(create_handoff_node())` when a regex/heuristic trigger matches — without waiting for the LLM to call `transfer_to_human`.
 

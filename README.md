@@ -65,6 +65,9 @@ The app auto-detects which backend to use from the `base_url` field — no code 
 ## Run
 
 ```bash
+# if not activated
+source /Users/D026233/dev/agent-receptionist/.venv/bin/activate
+
 make dev
 ```
 
@@ -147,11 +150,13 @@ Any eligible node → HANDOFF (on trigger) → CLOSING
 ```
 
 Intent routing from the `INTENT` node:
+
 - `booking` → `COLLECT_INFO` → booking flow
 - `reschedule` / `cancel` → `MANAGE_APPOINTMENT` (self-serve — no handoff)
 - `other` → `HANDOFF` (medical, billing, insurance disputes)
 
 Handoff triggers fire two ways:
+
 1. **LLM-driven** — the LLM calls `transfer_to_human` when the caller's request is out of scope.
 2. **Auto-triggered** — `HandoffEvaluator` (in `processors.py`) runs `evaluate_handoff()` on every caller transcription and forces a transition to the handoff node on: caller requests human, medical question, billing dispute, low STT confidence (2+ turns), caller frustration (repeated utterances).
 

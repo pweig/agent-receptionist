@@ -33,7 +33,7 @@ from pipecat_flows import FlowManager
 
 from .handoff import evaluate_handoff
 from .state import HandoffReason
-from .telemetry import append_event
+from .telemetry import append_event, log_llm_turn, log_stt_utterance
 
 
 # Nodes where an auto-handoff trigger should force a transition. Excludes
@@ -190,6 +190,15 @@ class LatencyStartMark(FrameProcessor):
             self._t.turn_start_ns = time.monotonic_ns()
             self._t._turn_text = frame.text
             self._t.armed = True
+            confidence: Optional[float] = None
+            if isinstance(frame.result, dict):
+                confidence = frame.result.get("language_probability")
+            log_stt_utterance(
+                log_path=self._t.log_path,
+                session_id=self._t.session_id,
+                confidence=confidence,
+                language=frame.language,
+            )
         await self.push_frame(frame, direction)
 
 
@@ -209,5 +218,10 @@ class LatencyEndMark(FrameProcessor):
         if isinstance(frame, TTSStartedFrame) and self._t.armed:
             elapsed_ms = (time.monotonic_ns() - self._t.turn_start_ns) / 1_000_000
             _append_latency_record(self._t, elapsed_ms)
+            log_llm_turn(
+                log_path=self._t.log_path,
+                session_id=self._t.session_id,
+                latency_ms=elapsed_ms,
+            )
             self._t.armed = False
         await self.push_frame(frame, direction)

@@ -93,6 +93,39 @@
 
 ---
 
+## Phase 1 — M2 DE tuning for 8 kHz phone audio
+
+The Phase 0 VAD and STT thresholds were tuned on 16 kHz WebRTC audio from the
+browser demo. Narrowband SIP audio (8 kHz, codec compression, phone-line
+noise) has a different VAD signature and systematically lower Whisper
+confidence. M2 re-tunes the two thresholds against a 10-call sample of real
+German phone calls.
+
+**Methodology:** see [m2-tuning-runbook.md](m2-tuning-runbook.md) for the full
+capture → offline-eval → adjust loop. The short version: `CAPTURE_CALLS=true`
+writes raw SLIN16 to `logs/captures/`, 10 calls across booking / reschedule /
+cancel / edge cases are placed, Whisper is re-run offline to get per-utterance
+`no_speech_prob`, and `make metrics` aggregates the distribution.
+
+**Acceptance:** STT confidence (`1 - no_speech_prob`) ≥ 0.70 on ≥ 90% of
+utterances in the sample, and no mid-sentence cut-offs on slow German speech.
+
+### Results
+
+Fill in after the 10-call tuning run. Keep one row per tuning round so the
+history is visible.
+
+| Date | `vad.stop_secs` | `stt.no_speech_prob` | N utterances | Mean conf | % ≥ 0.70 | Notes |
+|---|---|---|---|---|---|---|
+| _(Phase 0)_ | 0.5 | 0.5 | — | — | — | Browser/WebRTC baseline; not re-measured on 8 kHz |
+| _(pending)_ | ? | ? | — | — | — | M2 run — to be populated after capture |
+
+Once the acceptance threshold is met, copy the final values into
+[services/receptionist/config/settings.yaml](../services/receptionist/config/settings.yaml)
+and tick T4 in the M2 build plan.
+
+---
+
 ## Latency Budget (voice-first target: < 1s P95 end-to-end)
 
 | Component                    | Phase 0 (CPU)     | Phase 1 target                  |
