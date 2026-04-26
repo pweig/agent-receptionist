@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from services.receptionist.flows.nodes import (
-    _handle_get_office_hours,
+    _handle_record_consent,
     _handle_set_language,
     _handle_search_patient,
     _handle_request_slots,
@@ -20,8 +20,9 @@ from services.receptionist.flows.nodes import (
     _handle_select_appointment,
     create_collect_info_node,
     create_closing_node,
-    create_hours_check_node,
+    create_consent_node,
     create_handoff_node,
+    create_intent_node,
     create_slot_proposal_node,
     create_confirmation_node,
     create_manage_appointment_node,
@@ -31,93 +32,39 @@ from pipecat.frames.frames import TTSUpdateSettingsFrame
 
 
 # ---------------------------------------------------------------------------
-# _handle_get_office_hours
-# ---------------------------------------------------------------------------
-
-_OPEN_RESULT = {"open": "08:00", "close": "18:00"}
-_CLOSED_RESULT = {"closed": True, "emergency_number": "+49-800-111-2222", "message": "..."}
-
-
-async def test_get_office_hours_open_from_hours_check_transitions_to_intent(flow_manager):
-    flow_manager._node = "hours_check"
-    with patch("services.receptionist.flows.nodes.get_office_hours",
-               new=AsyncMock(return_value=_OPEN_RESULT)):
-        result, next_node = await _handle_get_office_hours({}, flow_manager)
-    assert next_node is not None
-    assert next_node.get("name") == "intent"
-    task_content = next_node["task_messages"][0]["content"]
-    assert "how you can help" in task_content.lower() or "Ask the caller" in task_content
-
-async def test_get_office_hours_closed_from_hours_check_transitions_to_closing(flow_manager):
-    flow_manager._node = "hours_check"
-    with patch("services.receptionist.flows.nodes.get_office_hours",
-               new=AsyncMock(return_value=_CLOSED_RESULT)):
-        result, next_node = await _handle_get_office_hours({}, flow_manager)
-    assert next_node is not None
-    task_content = next_node["task_messages"][0]["content"]
-    assert "Thank" in task_content or "closing" in str(next_node).lower()
-
-async def test_get_office_hours_from_non_hours_check_no_transition(flow_manager_collect_info):
-    with patch("services.receptionist.flows.nodes.get_office_hours",
-               new=AsyncMock(return_value=_OPEN_RESULT)):
-        result, next_node = await _handle_get_office_hours({}, flow_manager_collect_info)
-    assert next_node is None
-
-async def test_get_office_hours_stores_result_in_state(flow_manager):
-    flow_manager._node = "hours_check"
-    with patch("services.receptionist.flows.nodes.get_office_hours",
-               new=AsyncMock(return_value=_OPEN_RESULT)):
-        await _handle_get_office_hours({}, flow_manager)
-    assert flow_manager.state["office_hours"] == _OPEN_RESULT
-
-async def test_get_office_hours_handles_null_args(flow_manager):
-    flow_manager._node = "hours_check"
-    with patch("services.receptionist.flows.nodes.get_office_hours",
-               new=AsyncMock(return_value=_OPEN_RESULT)):
-        # None args must not raise AttributeError
-        result, _ = await _handle_get_office_hours(None, flow_manager)
-    assert result == _OPEN_RESULT
-
-
-# ---------------------------------------------------------------------------
 # _handle_set_language
 # ---------------------------------------------------------------------------
-
-async def test_set_language_from_greeting_transitions_to_hours_check(flow_manager_greeting):
-    result, next_node = await _handle_set_language({"language": "de"}, flow_manager_greeting)
-    assert next_node is not None
-    assert next_node.get("name") == "hours_check"
 
 async def test_set_language_from_non_greeting_no_transition(flow_manager_collect_info):
     result, next_node = await _handle_set_language({"language": "de"}, flow_manager_collect_info)
     assert next_node is None
 
-async def test_set_language_stores_language_in_state(flow_manager_greeting):
-    await _handle_set_language({"language": "de"}, flow_manager_greeting)
-    assert flow_manager_greeting.state["language"] == "de"
+async def test_set_language_stores_language_in_state(flow_manager):
+    await _handle_set_language({"language": "de"}, flow_manager)
+    assert flow_manager.state["language"] == "de"
 
-async def test_set_language_queues_tts_update_frame(flow_manager_greeting):
-    await _handle_set_language({"language": "de"}, flow_manager_greeting)
-    frames = flow_manager_greeting.task.queued_frames
+async def test_set_language_queues_tts_update_frame(flow_manager):
+    await _handle_set_language({"language": "de"}, flow_manager)
+    frames = flow_manager.task.queued_frames
     assert len(frames) == 1
     assert isinstance(frames[0], TTSUpdateSettingsFrame)
 
-async def test_set_language_tts_frame_has_correct_voice_de(flow_manager_greeting):
-    await _handle_set_language({"language": "de"}, flow_manager_greeting)
-    frame = flow_manager_greeting.task.queued_frames[0]
+async def test_set_language_tts_frame_has_correct_voice_de(flow_manager):
+    await _handle_set_language({"language": "de"}, flow_manager)
+    frame = flow_manager.task.queued_frames[0]
     assert frame.settings["voice"] == "de_DE-thorsten-high"
 
-async def test_set_language_tts_frame_has_correct_voice_en(flow_manager_greeting):
-    await _handle_set_language({"language": "en"}, flow_manager_greeting)
-    frame = flow_manager_greeting.task.queued_frames[0]
+async def test_set_language_tts_frame_has_correct_voice_en(flow_manager):
+    await _handle_set_language({"language": "en"}, flow_manager)
+    frame = flow_manager.task.queued_frames[0]
     assert frame.settings["voice"] == "en_US-ryan-high"
 
-async def test_set_language_unknown_code_falls_back_to_en(flow_manager_greeting):
-    result, _ = await _handle_set_language({"language": "fr"}, flow_manager_greeting)
+async def test_set_language_unknown_code_falls_back_to_en(flow_manager):
+    result, _ = await _handle_set_language({"language": "fr"}, flow_manager)
     assert result["language_set"] == "en"
 
-async def test_set_language_handles_null_args(flow_manager_greeting):
-    result, _ = await _handle_set_language(None, flow_manager_greeting)
+async def test_set_language_handles_null_args(flow_manager):
+    result, _ = await _handle_set_language(None, flow_manager)
     assert result["language_set"] == "en"  # default
 
 
@@ -485,3 +432,82 @@ async def test_cancel_not_found_does_not_emit_event(flow_manager, tmp_path):
                new=AsyncMock(return_value={"status": "not_found"})):
         await _handle_cancel_appointment({"confirmation_id": "X"}, flow_manager)
     assert not log.exists()
+
+
+# ---------------------------------------------------------------------------
+# _handle_record_consent — entry into the LLM flow
+# ---------------------------------------------------------------------------
+
+async def test_record_consent_accept_transitions_to_intent(flow_manager, tmp_path):
+    log = _attach_event_log(flow_manager, tmp_path)
+    _, next_node = await _handle_record_consent({"given": True}, flow_manager)
+    assert next_node is not None
+    assert next_node.get("name") == "intent"
+    assert flow_manager.state["consent_given"] is True
+    assert flow_manager.state["consent_timestamp"] is not None
+
+async def test_record_consent_decline_transitions_to_handoff(flow_manager, tmp_path):
+    _attach_event_log(flow_manager, tmp_path)
+    _, next_node = await _handle_record_consent({"given": False}, flow_manager)
+    assert next_node is not None
+    assert next_node.get("name") == "handoff"
+    assert flow_manager.state["consent_given"] is False
+    assert flow_manager.state["handoff_reason"] == "consent_declined"
+
+
+# ---------------------------------------------------------------------------
+# Structural invariants over every NodeConfig — catches "functions: []" holes
+# and end_conversation race conditions before they reach a live call.
+# ---------------------------------------------------------------------------
+
+# Every node factory in the flow graph. Update this list when nodes are added.
+ALL_NODE_FACTORIES = [
+    create_consent_node,
+    create_intent_node,
+    create_collect_info_node,
+    create_slot_proposal_node,
+    create_confirmation_node,
+    create_manage_appointment_node,
+    create_reschedule_slot_proposal_node,
+    create_handoff_node,
+    create_closing_node,
+]
+
+# Terminal nodes that legitimately have functions: [] because they end the call
+# via post_actions. Every other node must expose at least one transition tool.
+TERMINAL_NODES = {"closing"}
+
+
+@pytest.mark.parametrize("factory", ALL_NODE_FACTORIES, ids=lambda f: f.__name__)
+def test_every_non_terminal_node_has_a_transition_function(factory):
+    node = factory()
+    if node["name"] in TERMINAL_NODES:
+        return
+    assert node.get("functions"), (
+        f"Node '{node['name']}' has functions={node.get('functions')!r}. "
+        "Without a callable function the LLM can never advance the flow — "
+        "the call hangs in this state until the caller hangs up. "
+        "(See the 'after Yes, agent stops' bug from session 2026-04-25.)"
+    )
+
+
+@pytest.mark.parametrize("factory", ALL_NODE_FACTORIES, ids=lambda f: f.__name__)
+def test_end_conversation_post_actions_are_deferred(factory):
+    """A node with `end_conversation` in post_actions must set
+    `respond_immediately=False`, otherwise the action fires on node entry
+    and races any in-flight TTS — the closing announcement gets cut off
+    before the audio reaches the caller.
+    """
+    node = factory()
+    has_end_conversation = any(
+        a.get("type") == "end_conversation"
+        for a in node.get("post_actions", [])
+    )
+    if not has_end_conversation:
+        return
+    assert node.get("respond_immediately") is False, (
+        f"Node '{node['name']}' queues end_conversation but does not set "
+        "respond_immediately=False. With the default True, post_actions execute "
+        "synchronously on node entry and the EndFrame races the LLM's final TTS — "
+        "the caller hears nothing of the closing message."
+    )

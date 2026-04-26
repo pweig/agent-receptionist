@@ -73,8 +73,8 @@ async def test_no_trigger_in_greeting_node():
     assert "handoff_reason" not in fm.state
 
 
-async def test_no_trigger_in_hours_check_node():
-    fm = _MockFlowManager(current_node="hours_check")
+async def test_no_trigger_in_consent_node():
+    fm = _MockFlowManager(current_node="consent")
     proc = HandoffEvaluator()
     proc.flow_manager = fm
 
@@ -223,8 +223,12 @@ async def test_latency_records_round_trip(tmp_path: Path):
     assert tracker.armed is False
 
     assert log_path.exists()
-    record = json.loads(log_path.read_text().strip())
-    assert record["event"] == "turn_latency"
+    # The file now contains multiple events per turn (stt_utterance,
+    # turn_latency, llm_turn). Find the turn_latency record.
+    records = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    latency_records = [r for r in records if r["event"] == "turn_latency"]
+    assert len(latency_records) == 1
+    record = latency_records[0]
     assert record["session_id"] == "sess-42"
     assert record["turn_id"] == 1
     assert record["turn_latency_ms"] >= 0

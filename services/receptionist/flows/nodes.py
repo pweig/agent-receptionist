@@ -8,7 +8,8 @@ to signal intent (e.g., set_language, set_intent, select_slot, complete_handoff)
 
 Flow:
   (pipeline start) ──► consent  [two pre-roll tts_say clips: greeting, consent notice]
-  consent ──record_consent(true)──► hours_check ──get_office_hours──► intent / closing
+  (after-hours gate runs in main.py; closed calls hear a prepared announcement and never enter the flow)
+  consent ──record_consent(true)──► intent
   consent ──record_consent(false)──► handoff
   intent ──set_intent("booking")──► collect_info
   intent ──set_intent("reschedule"|"cancel")──► manage_appointment
@@ -36,7 +37,6 @@ from ..tools.pms_mock import (
     cancel_appointment,
     find_patient_appointments,
     get_available_slots,
-    get_office_hours,
     reschedule_appointment,
     search_patient,
     send_confirmation,
@@ -46,7 +46,6 @@ from ..tools.schemas import (
     CANCEL_APPOINTMENT_PROPS,
     FIND_PATIENT_APPOINTMENTS_PROPS,
     GET_AVAILABLE_SLOTS_PROPS,
-    GET_OFFICE_HOURS_PROPS,
     RESCHEDULE_APPOINTMENT_PROPS,
     SEARCH_PATIENT_PROPS,
     SEND_CONFIRMATION_PROPS,
@@ -96,23 +95,12 @@ async def _handle_record_consent(args: dict, flow_manager: FlowManager):
     if not given:
         flow_manager.state["handoff_reason"] = "consent_declined"
         return {"consent": "declined"}, create_handoff_node()
-    return {"consent": "given"}, create_hours_check_node()
+    return {"consent": "given"}, create_intent_node()
 
 
 # ---------------------------------------------------------------------------
 # Handlers — PMS tools
 # ---------------------------------------------------------------------------
-
-async def _handle_get_office_hours(args: dict, flow_manager: FlowManager):
-    result = await get_office_hours((args or {}).get("date"))
-    flow_manager.state["office_hours"] = result
-    # Only transition from the hours_check node; elsewhere return info without changing state.
-    if flow_manager.current_node == "hours_check":
-        if result.get("closed"):
-            return result, create_closing_node()
-        return result, create_intent_node()
-    return result, None
-
 
 async def _handle_search_patient(args: dict, flow_manager: FlowManager):
     a = args or {}
@@ -373,19 +361,6 @@ def create_set_language_schema() -> FlowsFunctionSchema:
     )
 
 
-def create_get_office_hours_schema() -> FlowsFunctionSchema:
-    """Global function — only transitions the flow when called from the hours_check node."""
-    return _fn(
-        name=GET_OFFICE_HOURS_PROPS["name"],
-        description=GET_OFFICE_HOURS_PROPS["description"],
-        properties=GET_OFFICE_HOURS_PROPS["properties"],
-        required=GET_OFFICE_HOURS_PROPS["required"],
-        handler=_handle_get_office_hours,
-    )
-
-
-
-
 def create_consent_node(lang: str = "de") -> NodeConfig:
     """Entry node for every call.
 
@@ -433,15 +408,6 @@ def create_consent_node(lang: str = "de") -> NodeConfig:
             {"type": "tts_say", "text": consent_text},
         ],
         "respond_immediately": False,
-    }
-
-
-def create_hours_check_node() -> NodeConfig:
-    return {
-        "name": "hours_check",
-        "role_messages": _role(),
-        "task_messages": _task("hours_check"),
-        "functions": [],
     }
 
 
@@ -675,5 +641,9 @@ def create_closing_node() -> NodeConfig:
         "role_messages": _role(),
         "task_messages": _task("closing"),
         "functions": [],
+        # Defer end_conversation until the LLM's closing TTS has actually
+        # played. With respond_immediately=True the post-action runs on node
+        # entry and races the LLM, cutting the trailing goodbye off the wire.
+        "respond_immediately": False,
         "post_actions": [{"type": "end_conversation"}],
     }

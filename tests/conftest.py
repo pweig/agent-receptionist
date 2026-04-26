@@ -57,7 +57,7 @@ class MockTask:
 
 
 class MockFlowManager:
-    def __init__(self, current_node: str = "hours_check"):
+    def __init__(self, current_node: str = "consent"):
         self.state: dict = {}
         self._node = current_node
         self.task = MockTask()
@@ -73,8 +73,8 @@ def flow_manager():
 
 
 @pytest.fixture
-def flow_manager_greeting():
-    return MockFlowManager(current_node="greeting")
+def flow_manager_consent():
+    return MockFlowManager(current_node="consent")
 
 
 @pytest.fixture

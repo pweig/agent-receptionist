@@ -129,8 +129,9 @@ def _utterances_similar(a: str, b: str) -> bool:
 #    from the info_collection handler when search_patient returns status="multiple"
 #    and the caller cannot disambiguate after 2 clarification turns.
 #
-# 4. Add OUTSIDE_HOURS trigger separately from AFTER_HOURS (currently handled
-#    in the hours_check node directly via get_office_hours tool call).
+# 4. Add OUTSIDE_HOURS trigger separately from AFTER_HOURS (currently the
+#    after-hours announcement plays from the entry gate in main.py before
+#    the LLM flow even starts; see office_status_now).
 #
 # Reschedule and cancel requests are already handled autonomously by the
 # manage_appointment flow (services/receptionist/flows/nodes.py).

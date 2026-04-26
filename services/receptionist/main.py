@@ -68,7 +68,6 @@ from .audiosocket_transport import AudioSocketParams, AudioSocketTransport
 from .privacy import log_pii_enabled, redact
 from .flows.nodes import (
     create_consent_node,
-    create_get_office_hours_schema,
     create_set_language_schema,
 )
 from .processors import (
@@ -79,6 +78,7 @@ from .processors import (
     WhisperSTTWithConfidence,
 )
 from .telemetry import log_call_end, log_call_start
+from .tools.pms_mock import office_status_now
 from .state import initial_state
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,13 @@ def _load_fallback_audio() -> bytes:
         return b""
 
 
+# After-hours entry-gate helpers live in .gate so tests can import them
+# without paying the cost of main.py's pipecat / Whisper / Piper imports.
+from .gate import is_enforced as _after_hours_enforced
+from .gate import kickoff_frames as _after_hours_frames
+from .gate import pipeline_params
+
+
 def _record_crash() -> bool:
     """Record a crash timestamp. Returns True if the crash limit is exceeded."""
     global _accepting_sip_connections
@@ -269,6 +276,8 @@ async def _build_pipeline(
     transport: BaseTransport,
     session_id: str,
     lang: str,
+    *,
+    allow_interruptions: bool = True,
 ) -> tuple[PipelineTask, FlowManager]:
     """Assemble the receptionist pipeline around a given transport.
 
@@ -366,7 +375,7 @@ async def _build_pipeline(
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
+            allow_interruptions=allow_interruptions,
             enable_metrics=True,
         ),
         idle_timeout_secs=300,
@@ -376,7 +385,7 @@ async def _build_pipeline(
         task=task,
         llm=llm,
         context_aggregator=context_aggregator,
-        global_functions=[create_set_language_schema(), create_get_office_hours_schema()],
+        global_functions=[create_set_language_schema()],
     )
     state = initial_state(session_id)
     state["language"] = lang
@@ -405,17 +414,30 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
         ),
     )
 
-    task, flow_manager = await _build_pipeline(transport, session_id, lang)
+    after_hours_text: str | None = None
+    if _after_hours_enforced():
+        status = office_status_now()
+        if not status["open"]:
+            after_hours_text = status["message"]
+
+    task, flow_manager = await _build_pipeline(
+        transport, session_id, lang,
+        **pipeline_params(after_hours_text is not None),
+    )
+    event_log_path = flow_manager.state.get("event_log_path")
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        await flow_manager.initialize(create_consent_node(lang))
+        if after_hours_text is not None:
+            # Skip the LLM flow entirely — speak the prepared announcement and end.
+            await task.queue_frames(_after_hours_frames(after_hours_text))
+        else:
+            await flow_manager.initialize(create_consent_node(lang))
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         await task.cancel()
 
-    event_log_path = flow_manager.state.get("event_log_path")
     log_call_start(event_log_path, session_id)
     call_start_mono = time.monotonic()
 
@@ -429,7 +451,7 @@ async def run_bot(webrtc_connection: SmallWebRTCConnection) -> None:
             event_log_path,
             session_id,
             duration_secs=time.monotonic() - call_start_mono,
-            intent=flow_manager.state.get("intent"),
+            intent="after_hours_block" if after_hours_text else flow_manager.state.get("intent"),
             handoff=flow_manager.state.get("handoff_reason") is not None,
             tool_errors=flow_manager.state.get("tool_error_count", 0),
         )
@@ -463,7 +485,18 @@ async def run_bot_sip(
         ),
     )
 
-    task, flow_manager = await _build_pipeline(transport, session_id, lang)
+    after_hours_text: str | None = None
+    if _after_hours_enforced():
+        status = office_status_now()
+        if not status["open"]:
+            after_hours_text = status["message"]
+            print(f"[GATE] after-hours: session {session_id} (lang={lang})", flush=True)
+
+    # See run_bot above for why interruptions are disabled when the gate trips.
+    task, flow_manager = await _build_pipeline(
+        transport, session_id, lang,
+        **pipeline_params(after_hours_text is not None),
+    )
 
     async def _kickoff():
         # The SIP "client" is already on the other end of the TCP socket when
@@ -471,7 +504,10 @@ async def run_bot_sip(
         # Wait until the pipeline has processed its StartFrame, then push the
         # greeting so Piper actually has a live transport to speak through.
         await transport.wait_until_pipeline_started()
-        await flow_manager.initialize(create_consent_node(lang))
+        if after_hours_text is not None:
+            await task.queue_frames(_after_hours_frames(after_hours_text))
+        else:
+            await flow_manager.initialize(create_consent_node(lang))
 
     async def _watch_disconnect():
         await transport.wait_until_disconnected()
@@ -512,7 +548,7 @@ async def run_bot_sip(
             event_log_path,
             session_id,
             duration_secs=time.monotonic() - call_start_mono,
-            intent=flow_manager.state.get("intent"),
+            intent="after_hours_block" if after_hours_text else flow_manager.state.get("intent"),
             handoff=flow_manager.state.get("handoff_reason") is not None,
             tool_errors=flow_manager.state.get("tool_error_count", 0),
         )

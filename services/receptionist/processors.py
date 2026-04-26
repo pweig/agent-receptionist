@@ -37,8 +37,7 @@ from .telemetry import append_event, log_llm_turn, log_stt_utterance
 
 
 # Nodes where an auto-handoff trigger should force a transition. Excludes
-# greeting (language not yet set), hours_check (transient), and handoff/closing
-# (already terminal).
+# consent (language not yet set) and handoff/closing (already terminal).
 _HANDOFF_ELIGIBLE_NODES = {
     "intent",
     "collect_info",

@@ -543,6 +543,50 @@ async def reschedule_appointment(confirmation_id: str, new_slot_id: str) -> dict
     return {"status": "rescheduled", "appointment": appt}
 
 
+_DE_DIGITS = {
+    "0": "null", "1": "eins", "2": "zwei", "3": "drei", "4": "vier",
+    "5": "fünf", "6": "sechs", "7": "sieben", "8": "acht", "9": "neun",
+}
+
+
+def _spoken_phone(phone: str, locale: str) -> str:
+    """Phone number rendered for TTS — digit-by-digit with comma pauses.
+
+    Piper inserts a brief pause on commas, so commas between digits give the
+    caller time to write the number down.
+    """
+    digits = "".join(c for c in phone if c.isdigit())
+    if locale == "de":
+        return ", ".join(_DE_DIGITS[d] for d in digits)
+    return ", ".join(digits)
+
+
+# Locale → key suffix in after_hours_routing for the emergency number.
+_EMERGENCY_KEY = {"de": "emergency_number_de", "en": "emergency_number_us"}
+
+
+def office_status_now() -> dict:
+    """Sync office-hours check used by the call entry gate.
+
+    Returns {"open": True} when the practice is open, otherwise
+    {"open": False, "emergency_number": "...", "message": "..."}.
+    The message is locale-aware via OFFICE_LOCALE and has the emergency
+    number rendered for TTS (digit-by-digit with comma pauses).
+    """
+    config = _load_office_hours()
+    is_open, _open_t, _close_t = _is_office_open(datetime.now(), config)
+    if is_open:
+        return {"open": True}
+    routing = config.get("after_hours_routing", {})
+    locale = os.environ.get("OFFICE_LOCALE", "de")
+    emergency = routing.get(_EMERGENCY_KEY.get(locale, "emergency_number_de"), "")
+    msg_key = f"message_{locale}"
+    message = routing.get(msg_key, routing.get("message_en", "")).format(
+        emergency_number=_spoken_phone(emergency, locale)
+    )
+    return {"open": False, "emergency_number": emergency, "message": message.strip()}
+
+
 async def get_office_hours(date_str: Optional[str] = None) -> dict:
     """
     Return office hours for a given date (defaults to today).

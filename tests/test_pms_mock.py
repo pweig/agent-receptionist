@@ -8,6 +8,8 @@ from services.receptionist.tools.pms_mock import (
     _name_matches,
     _german_date,
     _is_office_open,
+    _spoken_phone,
+    office_status_now,
     search_patient,
     get_available_slots,
     book_appointment,
@@ -468,3 +470,89 @@ async def test_reschedule_appointment_slot_taken():
     pms._BOOKED_SLOTS.add("2026-05-06-1000-checkup")  # someone else holds the target
     result = await reschedule_appointment(cid, "2026-05-06-1000-checkup")
     assert result["status"] == "slot_taken"
+
+
+# ---------------------------------------------------------------------------
+# _spoken_phone — TTS-friendly phone rendering for the after-hours gate
+# ---------------------------------------------------------------------------
+
+def test_spoken_phone_de_uses_german_digits_with_commas():
+    spoken = _spoken_phone("+49-800-111-2222", "de")
+    assert spoken == "vier, neun, acht, null, null, eins, eins, eins, zwei, zwei, zwei, zwei"
+
+def test_spoken_phone_en_uses_digits_with_commas():
+    spoken = _spoken_phone("+1-800-555-0123", "en")
+    assert spoken == "1, 8, 0, 0, 5, 5, 5, 0, 1, 2, 3"
+
+def test_spoken_phone_strips_non_digits():
+    # Spaces, dashes, plus, parens — all get stripped before rendering.
+    spoken = _spoken_phone("+1 (800) 555-0123", "en")
+    assert spoken == "1, 8, 0, 0, 5, 5, 5, 0, 1, 2, 3"
+
+
+# ---------------------------------------------------------------------------
+# office_status_now — entry-gate helper invoked before the LLM pipeline.
+# Patches the YAML loader and wall clock so tests are deterministic.
+# ---------------------------------------------------------------------------
+
+_OPEN_CONFIG = {
+    "weekday_hours": {
+        "monday": {"open": "08:00", "close": "18:00"},
+        "tuesday": {"open": "08:00", "close": "18:00"},
+        "wednesday": {"open": "08:00", "close": "18:00"},
+        "thursday": {"open": "08:00", "close": "18:00"},
+        "friday": {"open": "08:00", "close": "18:00"},
+        "saturday": "closed",
+        "sunday": "closed",
+    },
+    "exceptions": {},
+    "holidays": [],
+    "after_hours_routing": {
+        "emergency_number_de": "+49-800-111-2222",
+        "emergency_number_us": "+1-800-555-0123",
+        "message_de": "Geschlossen. Notfall: {emergency_number}.",
+        "message_en": "Closed. Emergency: {emergency_number}.",
+    },
+}
+
+# Tuesday 2026-04-21 at 10:00 — open per _OPEN_CONFIG.
+_OPEN_DT = datetime(2026, 4, 21, 10, 0)
+# Saturday 2026-04-25 at 23:00 — closed per _OPEN_CONFIG.
+_CLOSED_DT = datetime(2026, 4, 25, 23, 0)
+
+
+def test_office_status_open_returns_minimal_dict():
+    with patch("services.receptionist.tools.pms_mock._load_office_hours",
+               return_value=_OPEN_CONFIG), \
+         patch("services.receptionist.tools.pms_mock.datetime") as mock_dt:
+        mock_dt.now.return_value = _OPEN_DT
+        mock_dt.strftime = datetime.strftime
+        status = office_status_now()
+    assert status == {"open": True}
+
+def test_office_status_closed_returns_message_with_spoken_digits():
+    with patch("services.receptionist.tools.pms_mock._load_office_hours",
+               return_value=_OPEN_CONFIG), \
+         patch("services.receptionist.tools.pms_mock.datetime") as mock_dt:
+        mock_dt.now.return_value = _CLOSED_DT
+        mock_dt.strftime = datetime.strftime
+        # OFFICE_LOCALE defaults to "de" when not set
+        with patch.dict("os.environ", {"OFFICE_LOCALE": "de"}, clear=False):
+            status = office_status_now()
+    assert status["open"] is False
+    assert status["emergency_number"] == "+49-800-111-2222"
+    # Phone rendered digit-by-digit so Piper inserts pauses on commas.
+    assert "vier, neun, acht, null" in status["message"]
+    # Raw +49-... must NOT appear; that pronunciation is what the gate avoids.
+    assert "+49" not in status["message"]
+
+def test_office_status_locale_en_uses_us_emergency_number():
+    with patch("services.receptionist.tools.pms_mock._load_office_hours",
+               return_value=_OPEN_CONFIG), \
+         patch("services.receptionist.tools.pms_mock.datetime") as mock_dt:
+        mock_dt.now.return_value = _CLOSED_DT
+        mock_dt.strftime = datetime.strftime
+        with patch.dict("os.environ", {"OFFICE_LOCALE": "en"}, clear=False):
+            status = office_status_now()
+    assert status["emergency_number"] == "+1-800-555-0123"
+    assert "1, 8, 0, 0, 5" in status["message"]

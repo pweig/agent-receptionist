@@ -14,18 +14,6 @@ TTS_VOICES: dict[str, str] = {
 # Raw schema property dicts — imported by flows/nodes.py
 # ---------------------------------------------------------------------------
 
-GET_OFFICE_HOURS_PROPS = {
-    "name": "get_office_hours",
-    "description": "Check whether the practice is open on a given date and get opening hours.",
-    "properties": {
-        "date": {
-            "type": "string",
-            "description": "ISO date string YYYY-MM-DD. Defaults to today if omitted.",
-        }
-    },
-    "required": [],
-}
-
 SEARCH_PATIENT_PROPS = {
     "name": "search_patient",
     "description": (

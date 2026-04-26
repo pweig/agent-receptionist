@@ -29,6 +29,7 @@
       },
     ],
     "claudeCode.useTerminal": true,
+    "makefile.configureOnOpen": false,
   },
   "extensions": {
     "recommendations": [

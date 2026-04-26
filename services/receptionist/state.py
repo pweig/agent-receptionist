@@ -4,9 +4,7 @@ from typing import Optional
 
 
 class ConversationState(str, Enum):
-    GREETING = "greeting"
-    LANGUAGE_DETECT = "language_detection"
-    HOURS_CHECK = "hours_check"
+    CONSENT = "consent"
     INTENT = "intent"
     INFO_COLLECTION = "info_collection"
     SLOT_PROPOSAL = "slot_proposal"
@@ -45,20 +43,18 @@ class CollectedInfo:
 
 
 # State transition table (informational — transitions are enforced by NodeConfig handler
-# return values in flows/nodes.py):
+# return values in flows/nodes.py). The after-hours gate runs in main.py before
+# the flow is initialized; closed calls never enter any of these states.
 #
-#   GREETING         → LANGUAGE_DETECT   (first utterance received)
-#   LANGUAGE_DETECT  → HOURS_CHECK       (language detected; TTS voice switched)
-#   HOURS_CHECK      → INTENT            (office is open)
-#   HOURS_CHECK      → CLOSING           (office is closed)
-#   INTENT           → INFO_COLLECTION   (appointment booking intent)
-#   INTENT           → HANDOFF           (reschedule, cancel, medical Q, billing)
+#   CONSENT          → INTENT            (caller answers Ja)
+#   CONSENT          → HANDOFF           (caller answers Nein)
+#   INTENT           → INFO_COLLECTION   (booking)
+#   INTENT           → HANDOFF           (medical Q, billing, etc.)
 #   INFO_COLLECTION  → SLOT_PROPOSAL     (all required fields collected)
-#   INFO_COLLECTION  → HANDOFF           (ambiguous patient; persistent confusion)
+#   INFO_COLLECTION  → HANDOFF           (ambiguous patient)
 #   SLOT_PROPOSAL    → SLOT_PROPOSAL     (caller wants alternatives — node loops)
 #   SLOT_PROPOSAL    → CONFIRMATION      (slot accepted)
 #   CONFIRMATION     → CLOSING           (book + confirm called)
-#   CONFIRMATION     → SLOT_PROPOSAL     (caller changes mind)
 #   Any state        → HANDOFF           (evaluate_handoff() fires)
 #   HANDOFF          → CLOSING           (transfer done or callback logged)
 
@@ -66,8 +62,8 @@ class CollectedInfo:
 def initial_state(session_id: str) -> dict:
     return {
         "session_id": session_id,
-        "language": None,                     # Language enum, set at LANGUAGE_DETECT
-        "current_state": ConversationState.GREETING,
+        "language": None,                     # Language enum, set when caller's language is detected
+        "current_state": ConversationState.CONSENT,
         "consent_given": None,                # True/False once record_consent is called
         "consent_timestamp": None,            # ISO-8601 timestamp of the consent decision
         "info": CollectedInfo(),
