@@ -35,6 +35,7 @@ dev:
 # Requires services/telephony/ Asterisk container to be up and registered with
 # the FritzBox. See docs/phase1-m1-fritzbox-setup.md.
 dev-sip:
+	@bash services/telephony/preflight.sh
 	@echo ""
 	@echo "  Starting agent in SIP mode — AudioSocket listener on :8089"
 	@echo "  Asterisk (services/telephony/) must be running and a call routed"

@@ -77,6 +77,59 @@ Opens http://localhost:7860 — click **Start Call** to connect your browser mic
 
 ---
 
+## Run — SIP / Phone Mode (Phase 1)
+
+To take real phone calls through the FritzBox instead of the browser, three things must be running:
+
+1. **Asterisk** (Docker) — registers with the FritzBox, terminates the SIP call, bridges audio to AudioSocket
+2. **Ollama** (or Groq) — the LLM backend
+3. **The agent in SIP mode** — listens on TCP `:8089` for Asterisk's AudioSocket stream
+
+### One-time setup
+
+Configure the FritzBox + Asterisk per [docs/phase1-m1-fritzbox-setup.md](docs/phase1-m1-fritzbox-setup.md):
+
+```bash
+cp services/telephony/.env.example services/telephony/.env
+# fill in FRITZBOX_USER / FRITZBOX_PASS / EXTERNAL_IP
+docker compose -f services/telephony/docker-compose.yml build
+```
+
+### Day-to-day startup (3 terminals)
+
+**Terminal 1 — Asterisk:**
+
+```bash
+cd services/telephony
+docker compose up
+# wait for "Outbound registration successful"
+```
+
+**Terminal 2 — Ollama** (skip if you're on Groq):
+
+```bash
+ollama serve
+```
+
+**Terminal 3 — agent in SIP mode:**
+
+```bash
+make dev-sip
+# AudioSocket listener on :8089
+```
+
+Call your FritzBox number — Asterisk answers, dials `host.docker.internal:8089`, and the call runs through the same Pipecat pipeline as the WebRTC path.
+
+`Ctrl+C` each terminal to stop. If the agent crashed and left `:8089` bound, free it with:
+
+```bash
+kill $(lsof -ti:8089)
+```
+
+See [docs/sip-debugging-runbook.md](docs/sip-debugging-runbook.md) when something doesn't connect.
+
+---
+
 ## Configuration
 
 **Office hours:** `services/receptionist/config/office_hours.yaml`
@@ -215,7 +268,43 @@ Check that you granted microphone permission when prompted. Use Chrome or Firefo
 The FastAPI lifespan handler cancels all active bot tasks on shutdown. If it hangs, force-kill the port:
 
 ```bash
-kill $(lsof -ti:7860)
+kill $(lsof -ti:7860)   # WebRTC mode
+kill $(lsof -ti:8089)   # SIP mode (AudioSocket listener)
+```
+
+**SIP: `address already in use` on :8089 when running `make dev-sip`**
+A previous SIP-mode agent is still bound to the AudioSocket port (often after a crash where the parent process died but the child kept the socket). Find and kill it:
+
+```bash
+lsof -nP -iTCP:8089 -sTCP:LISTEN   # confirm what's holding it
+kill $(lsof -ti:8089)              # SIGTERM; add -9 if it ignores
+```
+
+**SIP: phone rings ~5 times then goes to voicemail; agent never picks up**
+First, the most common cause: the host's LAN IP changed (DHCP renewal, switching networks) but `EXTERNAL_IP` in `services/telephony/.env` still points at the old one. Asterisk then registers a Contact header FritzBox can't reach, so INVITEs never arrive and the FritzBox falls back to its own voicemail. `make dev-sip` now runs `services/telephony/preflight.sh` automatically to detect and fix this — invoke it directly if you're starting the container by hand:
+
+```bash
+bash services/telephony/preflight.sh
+```
+
+If that reports `ok` but the symptom persists, the call really isn't reaching Asterisk. To distinguish "FritzBox dropped the call" from "Asterisk dropped the call", confirm whether Asterisk ever sees an `INVITE`:
+
+```bash
+docker exec agent-asterisk asterisk -rx "pjsip set logger on"
+docker logs -f --since 1s agent-asterisk | grep -aE 'INVITE|From:|No matching'
+# now place the test call
+```
+
+- **No `INVITE` line appears** → FritzBox is not delivering the call. Check `fritz.box → Telefonie → Telefoniegeräte → receptionist → Rufnummern (eingehend)` — the dialed number must be ticked there. Then check `Telefonie → Anrufbeantworter` for the same number; the AB must not pick up before (or instead of) the IP phone.
+- **`INVITE` arrives but `No matching endpoint` follows** → identify-match in `pjsip.conf` doesn't cover the source IP. The Docker-on-Mac fix is gotcha #4 in [docs/phase1-m1-fritzbox-setup.md](docs/phase1-m1-fritzbox-setup.md): include both `${FRITZBOX_HOST}` and `192.168.65.0/24` in `[fritzbox-identify]`.
+- **`INVITE` arrives, dialplan executes, but caller hears nothing** → AudioSocket can't reach `host.docker.internal:8089`. Confirm `make dev-sip` is running and `lsof -nP -iTCP:8089 -sTCP:LISTEN` shows a `Python` process.
+
+**SIP: registration check**
+If unsure whether Asterisk is registered with the FritzBox at all:
+
+```bash
+docker exec agent-asterisk asterisk -rx "pjsip show registrations"
+# Status should be "Registered" with a positive expiry. "Rejected" = bad password.
 ```
 
 **Piper model missing / TTS silent**
